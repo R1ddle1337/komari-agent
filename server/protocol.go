@@ -43,6 +43,12 @@ func shouldFallbackToV1(err error) bool {
 		switch status.StatusCode {
 		case http.StatusOK, http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
 			return true
+		case http.StatusBadRequest:
+			// 1.4.x 主控将 JSON-RPC method-not-found 映射为 HTTP 400。
+			// 仅认可完整 v2 错误信封，不能把参数错误或鉴权失败当成协议缺失。
+			var response v2.Response
+			return json.Unmarshal([]byte(status.Body), &response) == nil &&
+				response.JSONRPC == v2.Version && response.Error != nil && response.Error.Code == -32601
 		}
 	}
 	var format *v2FormatError

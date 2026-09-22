@@ -226,11 +226,17 @@ func TestTaskResultSupportsLegacyAndMixedPanels(t *testing.T) {
 		response  string
 		wantV1    bool
 		wantError bool
+		status    int
 	}{
-		{"legacy", 1, "", true, false},
-		{"modern", 2, `{"jsonrpc":"2.0","result":{}}`, false, false},
-		{"mixed-1.4.3", 2, `{"jsonrpc":"2.0","error":{"code":-32601,"message":"method not found"}}`, true, false},
-		{"denied", 2, `{"jsonrpc":"2.0","error":{"code":-32001,"message":"denied"}}`, false, true},
+		{"legacy", 1, "", true, false, http.StatusOK},
+		{"modern", 2, `{"jsonrpc":"2.0","result":{}}`, false, false, http.StatusOK},
+		{"method-not-found-200", 2, `{"jsonrpc":"2.0","error":{"code":-32601,"message":"method not found"}}`, true, false, http.StatusOK},
+		{"mixed-1.4.3-http400", 2, `{"jsonrpc":"2.0","error":{"code":-32601,"message":"method not found"}}`, true, false, http.StatusBadRequest},
+		{"invalid-params-http400", 2, `{"jsonrpc":"2.0","error":{"code":-32602,"message":"invalid params"}}`, false, true, http.StatusBadRequest},
+		{"unrecognized-http400", 2, `<html>bad request</html>`, false, true, http.StatusBadRequest},
+		{"wrong-rpc-version-http400", 2, `{"jsonrpc":"1.0","error":{"code":-32601,"message":"method not found"}}`, false, true, http.StatusBadRequest},
+		{"forbidden-does-not-fallback", 2, `{"jsonrpc":"2.0","error":{"code":-32601,"message":"method not found"}}`, false, true, http.StatusForbidden},
+		{"denied", 2, `{"jsonrpc":"2.0","error":{"code":-32001,"message":"denied"}}`, false, true, http.StatusOK},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			preservePanelConfig(t)
@@ -243,6 +249,7 @@ func TestTaskResultSupportsLegacyAndMixedPanels(t *testing.T) {
 					if body["method"] != v2.MethodAgentTaskResult {
 						t.Errorf("bad method: %+v", body)
 					}
+					w.WriteHeader(test.status)
 					_, _ = io.WriteString(w, test.response)
 				case "/api/clients/task/result":
 					legacyCalls.Add(1)
