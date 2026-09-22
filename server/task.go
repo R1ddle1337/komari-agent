@@ -22,21 +22,21 @@ import (
 	ping "github.com/prometheus-community/pro-bing"
 )
 
-func NewTask(task_id, command string) {
+func NewTask(protocolVersion int, task_id, command string) {
 	if task_id == "" {
 		return
 	}
 	if strings.TrimSpace(command) == "" {
-		uploadTaskResult(task_id, "No command provided", 0, time.Now())
+		uploadTaskResult(protocolVersion, task_id, "No command provided", 0, time.Now())
 		return
 	}
 	if flags.DisableWebSsh {
-		uploadTaskResult(task_id, "Remote control is disabled.", -1, time.Now())
+		uploadTaskResult(protocolVersion, task_id, "Remote control is disabled.", -1, time.Now())
 		return
 	}
 	log.Printf("Executing task %s with command: %s", task_id, command)
 	result, exitCode := runTaskCommand(command)
-	uploadTaskResult(task_id, result, exitCode, time.Now())
+	uploadTaskResult(protocolVersion, task_id, result, exitCode, time.Now())
 }
 
 func runTaskCommand(command string) (string, int) {
@@ -111,20 +111,28 @@ func appendErrorResult(result, err string) string {
 	return result + "\n" + err
 }
 
-func uploadTaskResult(taskID, result string, exitCode int, finishedAt time.Time) {
+func uploadTaskResult(protocolVersion int, taskID, result string, exitCode int, finishedAt time.Time) {
+	if err := sendTaskResult(protocolVersion, taskID, result, exitCode, finishedAt); err != nil {
+		log.Printf("Failed to upload task result: %v", err)
+	}
+}
+
+func sendTaskResult(protocolVersion int, taskID, result string, exitCode int, finishedAt time.Time) error {
+	params := v2.TaskResultParams{TaskID: taskID, Result: result, ExitCode: exitCode, FinishedAt: finishedAt}
+	if protocolVersion == 1 {
+		return postV1JSON("/api/clients/task/result", params)
+	}
 	payload := v2.Request{
 		JSONRPC: v2.Version,
 		Method:  v2.MethodAgentTaskResult,
-		Params: v2.TaskResultParams{
-			TaskID:     taskID,
-			Result:     result,
-			ExitCode:   exitCode,
-			FinishedAt: finishedAt,
-		},
+		Params:  params,
 	}
-	if err := postV2RPC(payload); err != nil {
-		log.Printf("Failed to upload task result: %v", err)
+	err := postV2RPC(payload)
+	if shouldFallbackToV1(err) {
+		// 1.4.x 面板支持 v2 上报，但命令结果仍使用旧 REST 接口；不降级整条连接。
+		return postV1JSON("/api/clients/task/result", params)
 	}
+	return err
 }
 
 // resolveIP 解析域名到 IP 地址，排除 DNS 查询时间
@@ -247,7 +255,7 @@ func httpPing(target string, timeout time.Duration) (int64, error) {
 	return latency, errors.New("http status not ok")
 }
 
-func NewPingTask(conn *ws.SafeConn, taskID uint, pingType, pingTarget string) {
+func NewPingTask(conn *ws.SafeConn, protocolVersion int, taskID uint, pingType, pingTarget string) {
 	if taskID == 0 {
 		log.Printf("Invalid task ID: %d", taskID)
 		return
@@ -306,22 +314,28 @@ func NewPingTask(conn *ws.SafeConn, taskID uint, pingType, pingTarget string) {
 		pingResult = int(latency)
 	}
 	finishedAt := time.Now()
-	wsPayload := v2.BuildPingResultPayload(taskID, pingType, pingResult, finishedAt)
+	if err := sendPingResult(conn, protocolVersion, taskID, pingType, pingResult, finishedAt); err != nil {
+		log.Printf("Failed to upload ping result: %v", err)
+	}
+}
+
+func sendPingResult(conn *ws.SafeConn, protocolVersion int, taskID uint, pingType string, result int, finishedAt time.Time) error {
+	var wsPayload interface{} = v2.BuildPingResultPayload(taskID, pingType, result, finishedAt)
+	if protocolVersion == 1 {
+		wsPayload = map[string]interface{}{"type": "ping_result", "task_id": taskID, "ping_type": pingType, "value": result, "finished_at": finishedAt}
+	}
 	// https://github.com/komari-monitor/komari/commit/eb87a4fc330b7d1c407fa4ff70177615a4f50a1f
 	// -1 代表丢包，服务端计算
 	//if pingResult == -1 {
 	//	return
 	//}
 	if conn == nil {
-		if err := postV2RPC(wsPayload); err != nil {
-			log.Printf("Failed to upload ping result over POST: %v", err)
+		if protocolVersion == 1 {
+			return postV1JSON("/api/clients/ping/result", wsPayload)
 		}
-		return
+		return postV2RPC(wsPayload)
 	}
-	if err := conn.WriteJSON(wsPayload); err != nil {
-		log.Printf("Failed to write JSON to WebSocket: %v", err)
-	}
-
+	return conn.WriteJSON(wsPayload)
 }
 
 func postV2RPC(payload interface{}) error {
