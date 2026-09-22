@@ -132,3 +132,13 @@ func TestAppendErrorResultAvoidsLeadingNewline(t *testing.T) {
 func shellSingleQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
+
+func TestLargeTaskOutputKeepsExitStatus(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix output producer")
+	}
+	result, exit := runTaskCommand("head -c 2097152 /dev/zero | tr '\\000' 'x'; exit 7")
+	if exit != 7 || !strings.HasSuffix(result, taskOutputTruncated) || len(result) > maxTaskOutputBytes+len(taskOutputTruncated) {
+		t.Fatalf("large task result: exit=%d bytes=%d", exit, len(result))
+	}
+}

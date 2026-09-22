@@ -18,7 +18,7 @@ import (
 
 	"github.com/blang/semver"
 	"github.com/komari-monitor/komari-agent/dnsresolver"
-	"github.com/rhysd/go-github-selfupdate/selfupdate"
+	"github.com/komari-monitor/komari-agent/internal/selfupdate"
 )
 
 var ErrRestartRequired = errors.New("update installed; restart required")
@@ -256,15 +256,17 @@ func (v *checksumValidator) Validate(binary, checksum []byte) error {
 
 func updaterConfig() selfupdate.Config {
 	return selfupdate.Config{
-		Validator: &checksumValidator{},
-		Filters:   []string{"^" + regexp.QuoteMeta(expectedAssetName(runtime.GOOS, runtime.GOARCH)) + "$"},
+		Validator:  &checksumValidator{},
+		AssetName:  expectedAssetName(runtime.GOOS, runtime.GOARCH),
+		HTTPClient: dnsresolver.GetHTTPClient(60 * time.Second),
+		APIToken:   os.Getenv("GITHUB_TOKEN"),
 	}
 }
 
 func listGitHubReleases(owner, repo string) ([]githubRelease, error) {
 	var releases []githubRelease
 
-	for page := 1; ; page++ {
+	for page := 1; page <= 20; page++ {
 		endpoint := fmt.Sprintf(
 			"%s/repos/%s/%s/releases?per_page=100&page=%d",
 			githubAPIBaseURL,
@@ -283,7 +285,7 @@ func listGitHubReleases(owner, repo string) ([]githubRelease, error) {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
 
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := dnsresolver.GetHTTPClient(60 * time.Second).Do(req)
 		if err != nil {
 			return nil, fmt.Errorf("failed to list GitHub releases: %w", err)
 		}
@@ -295,7 +297,7 @@ func listGitHubReleases(owner, repo string) ([]githubRelease, error) {
 		}
 
 		var pageReleases []githubRelease
-		if err := json.NewDecoder(resp.Body).Decode(&pageReleases); err != nil {
+		if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&pageReleases); err != nil {
 			_ = resp.Body.Close()
 			return nil, fmt.Errorf("failed to decode GitHub releases response: %w", err)
 		}
@@ -306,6 +308,7 @@ func listGitHubReleases(owner, repo string) ([]githubRelease, error) {
 			return releases, nil
 		}
 	}
+	return nil, errors.New("release listing exceeds 20 pages")
 }
 
 func currentExecutablePath() (string, error) {
@@ -460,7 +463,6 @@ func CheckAndUpdate() error {
 		return err
 	}
 
-	http.DefaultClient = dnsresolver.GetHTTPClient(60 * time.Second)
 	updater, err := selfupdate.NewUpdater(updaterConfig())
 	if err != nil {
 		return fmt.Errorf("failed to create updater: %v", err)

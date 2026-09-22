@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -34,7 +33,7 @@ func NewTask(protocolVersion int, task_id, command string) {
 		uploadTaskResult(protocolVersion, task_id, "Remote control is disabled.", -1, time.Now())
 		return
 	}
-	log.Printf("Executing task %s with command: %s", task_id, command)
+	log.Printf("Executing task %s (%d command bytes)", task_id, len(command))
 	result, exitCode := runTaskCommand(command)
 	uploadTaskResult(protocolVersion, task_id, result, exitCode, time.Now())
 }
@@ -46,7 +45,7 @@ func runTaskCommand(command string) (string, int) {
 	}
 	defer cleanup()
 
-	var stdout, stderr bytes.Buffer
+	var stdout, stderr taskOutput
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
@@ -365,7 +364,7 @@ func postV2RPC(payload interface{}) error {
 		return err
 	}
 	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readControlResponse(resp.Body)
 	if err != nil {
 		return err
 	}

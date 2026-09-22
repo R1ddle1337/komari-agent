@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/blang/semver"
-	"github.com/rhysd/go-github-selfupdate/selfupdate"
+	"github.com/komari-monitor/komari-agent/internal/selfupdate"
 )
 
 type fakeSelfUpdater struct {

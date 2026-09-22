@@ -3,10 +3,10 @@ package server
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/komari-monitor/komari-agent/dnsresolver"
@@ -19,9 +19,11 @@ import (
 )
 
 var flags = pkg_flags.GlobalConfig
+var basicInfoMu sync.Mutex
 
 func DoUploadBasicInfoWorks() {
-	ticker := time.NewTicker(time.Duration(flags.InfoReportInterval) * time.Minute)
+	ticker := time.NewTicker(time.Duration(max(1, flags.InfoReportInterval)) * time.Minute)
+	defer ticker.Stop()
 	for range ticker.C {
 		err := uploadBasicInfo()
 		if err != nil {
@@ -38,6 +40,10 @@ func UpdateBasicInfo() {
 	}
 }
 func uploadBasicInfo() error {
+	if !basicInfoMu.TryLock() {
+		return nil
+	}
+	defer basicInfoMu.Unlock()
 	cpu := monitoring.CpuStaticInfo()
 
 	osname := monitoring.OSName()
@@ -113,7 +119,7 @@ func tryUploadDataWithProtocol(data map[string]interface{}, protocolVersion int)
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := readControlResponse(resp.Body)
 	if err != nil {
 		return err
 	}

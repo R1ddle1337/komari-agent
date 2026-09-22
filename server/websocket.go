@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"net/http"
@@ -281,7 +280,7 @@ func postV2RequestContext(ctx context.Context, payload []byte) (*v2.Response, er
 		return nil, err
 	}
 	defer resp.Body.Close()
-	bytesBody, err := io.ReadAll(resp.Body)
+	bytesBody, err := readControlResponse(resp.Body)
 	if err != nil {
 		return nil, err
 	}

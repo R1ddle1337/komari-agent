@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/blang/semver"
-	"github.com/rhysd/go-github-selfupdate/selfupdate"
+	"github.com/komari-monitor/komari-agent/internal/selfupdate"
 )
 
 func TestRepoSlugValidation(t *testing.T) {
@@ -194,7 +194,7 @@ func TestChecksumFailureLeavesBinaryUntouched(t *testing.T) {
 			defer server.Close()
 			config := updaterConfig()
 			config.APIToken = "test-only"
-			config.EnterpriseBaseURL = server.URL + "/"
+			config.APIBaseURL = server.URL + "/"
 			updater, err := selfupdate.NewUpdater(config)
 			if err != nil {
 				t.Fatal(err)
@@ -227,7 +227,7 @@ func TestStableDetectionRejectsMissingChecksum(t *testing.T) {
 	defer server.Close()
 	config := updaterConfig()
 	config.APIToken = "test-only"
-	config.EnterpriseBaseURL = server.URL + "/"
+	config.APIBaseURL = server.URL + "/"
 	updater, err := selfupdate.NewUpdater(config)
 	if err != nil {
 		t.Fatal(err)

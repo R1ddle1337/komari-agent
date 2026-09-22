@@ -120,17 +120,16 @@ var RootCmd = &cobra.Command{
 		}
 		// 自动更新
 		if !flags.DisableAutoUpdate {
-			err := update.CheckAndUpdate()
-			if handleUpdateCheckResult(err, shutdown) {
-				return nil
-			}
-			go update.DoUpdateWorks(func() {
-				shutdown.shutdown(42)
-			})
+			go func() {
+				if handleUpdateCheckResult(update.CheckAndUpdate(), shutdown) {
+					return
+				}
+				update.DoUpdateWorks(func() { shutdown.shutdown(42) })
+			}()
 		}
 		go server.DoUploadBasicInfoWorks()
 		for {
-			server.UpdateBasicInfo()
+			go server.UpdateBasicInfo()
 			server.EstablishWebSocketConnection()
 		}
 	},

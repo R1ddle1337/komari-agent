@@ -6,7 +6,8 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"regexp"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/komari-monitor/komari-agent/dnsresolver"
@@ -45,79 +46,76 @@ var (
 	userAgent = "curl/8.0.1"
 )
 
-func GetIPv4Address() (string, error) {
+const publicIPTimeout = 12 * time.Second
+const publicIPSourceTimeout = 4 * time.Second
+const maxPublicIPResponseBytes = 64 << 10
 
-	webAPIs := []string{
+func GetIPv4Address() (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), publicIPTimeout)
+	defer cancel()
+	return lookupPublicIP(ctx, ipv4HTTPClient, []string{
 		"https://www.visa.cn/cdn-cgi/trace",
 		"https://www.qualcomm.cn/cdn-cgi/trace",
 		"https://www.toutiao.com/stream/widget/local_weather/data/",
 		"https://edge-ip.html.zone/geo",
 		"https://vercel-ip.html.zone/geo",
-		"http://ipv4.ip.sb",
+		"https://ipv4.ip.sb",
 		"https://api.ipify.org?format=json",
-	}
-
-	for _, api := range webAPIs {
-		// get ipv4
-		req, err := http.NewRequest("GET", api, nil)
-		if err != nil {
-			continue
-		}
-		req.Header.Set("User-Agent", userAgent)
-		resp, err := ipv4HTTPClient.Do(req)
-		if err != nil {
-			continue
-		}
-		body, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close() // 获取后立即关闭防止堵塞
-		if err != nil {
-			continue
-		}
-		re := regexp.MustCompile(`\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}`)
-		ipv4 := re.FindString(string(body))
-		if ipv4 != "" {
-			log.Printf("Get IPV4 Success: %s", ipv4)
-			return ipv4, nil
-		}
-	}
-	return "", nil
+	}, true)
 }
 
 func GetIPv6Address() (string, error) {
-
-	webAPIs := []string{
+	ctx, cancel := context.WithTimeout(context.Background(), publicIPTimeout)
+	defer cancel()
+	return lookupPublicIP(ctx, ipv6HTTPClient, []string{
 		"https://v6.ip.zxinc.org/info.php?type=json",
 		"https://api6.ipify.org?format=json",
 		"https://ipv6.icanhazip.com",
-		"http://api-ipv6.ip.sb/geoip",
-	}
+		"https://api-ipv6.ip.sb/geoip",
+	}, false)
+}
 
-	for _, api := range webAPIs {
-		// get ipv6
-		req, err := http.NewRequest("GET", api, nil)
+func lookupPublicIP(ctx context.Context, client *http.Client, sources []string, ipv4 bool) (string, error) {
+	for _, source := range sources {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		requestCtx, cancel := context.WithTimeout(ctx, publicIPSourceTimeout)
+		req, err := http.NewRequestWithContext(requestCtx, http.MethodGet, source, nil)
 		if err != nil {
+			cancel()
 			continue
 		}
 		req.Header.Set("User-Agent", userAgent)
-		resp, err := ipv6HTTPClient.Do(req)
+		response, err := client.Do(req)
 		if err != nil {
+			cancel()
 			continue
 		}
-		body, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close() // 获取后立即关闭防止堵塞
-		if err != nil {
+		body, err := io.ReadAll(io.LimitReader(response.Body, maxPublicIPResponseBytes+1))
+		_ = response.Body.Close()
+		cancel()
+		if err != nil || response.StatusCode != http.StatusOK || len(body) > maxPublicIPResponseBytes {
 			continue
 		}
-
-		// 使用正则表达式从响应体中提取IPv6地址
-		re := regexp.MustCompile(`(([0-9A-Fa-f]{1,4}:){7})([0-9A-Fa-f]{1,4})|(([0-9A-Fa-f]{1,4}:){1,6}:)(([0-9A-Fa-f]{1,4}:){0,4})([0-9A-Fa-f]{0,4})`)
-		ipv6 := re.FindString(string(body))
-		if ipv6 != "" {
-			log.Printf("Get IPV6 Success:  %s", ipv6)
-			return ipv6, nil
+		if ip := parsePublicIP(string(body), ipv4); ip != "" {
+			return ip, nil
 		}
 	}
-	return "", nil
+	return "", ctx.Err()
+}
+
+func parsePublicIP(text string, ipv4 bool) string {
+	candidates := strings.FieldsFunc(text, func(r rune) bool {
+		return !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') || r == ':' || r == '.')
+	})
+	for _, candidate := range candidates {
+		parsed := net.ParseIP(candidate)
+		if parsed != nil && (parsed.To4() != nil) == ipv4 && parsed.IsGlobalUnicast() && !parsed.IsPrivate() {
+			return parsed.String()
+		}
+	}
+	return ""
 }
 
 func GetIPAddress() (ipv4, ipv6 string, err error) {
@@ -135,24 +133,19 @@ func GetIPAddress() (ipv4, ipv6 string, err error) {
 		}
 	}
 
-	if flags.CustomIpv4 != "" {
-		ipv4 = flags.CustomIpv4
-	} else {
-		ipv4, err = GetIPv4Address()
-		if err != nil {
-			log.Printf("Get IPV4 Error: %v", err)
-			ipv4 = ""
-		}
+	// Families are independent. A missing IPv6 route must not delay IPv4
+	// metadata by another full chain of remote provider timeouts.
+	var lookups sync.WaitGroup
+	ipv4, ipv6 = flags.CustomIpv4, flags.CustomIpv6
+	if ipv4 == "" {
+		lookups.Add(1)
+		go func() { defer lookups.Done(); ipv4, _ = GetIPv4Address() }()
 	}
-	if flags.CustomIpv6 != "" {
-		ipv6 = flags.CustomIpv6
-	} else {
-		ipv6, err = GetIPv6Address()
-		if err != nil {
-			log.Printf("Get IPV6 Error: %v", err)
-			ipv6 = ""
-		}
+	if ipv6 == "" {
+		lookups.Add(1)
+		go func() { defer lookups.Done(); ipv6, _ = GetIPv6Address() }()
 	}
+	lookups.Wait()
 
 	return ipv4, ipv6, nil
 }
