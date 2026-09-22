@@ -1,0 +1,38 @@
+name: Test Owned Agent
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    if: github.repository == 'R1ddle1337/komari-agent'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.8"
+          cache: false
+      - name: Verify pinned dependencies
+        run: |
+          go mod download
+          go mod verify
+      - name: Precompile tests outside the execution deadline
+        run: |
+          mkdir -p "$RUNNER_TEMP/komari-test-binaries"
+          go test -c -o "$RUNNER_TEMP/komari-test-binaries/" ./...
+      - name: Run unit tests with a 60-second deadline
+        run: timeout --signal=TERM --kill-after=5s 60s go test -count=1 -timeout 60s ./...
+      - name: Test POSIX installer verification and replacement
+        run: timeout --signal=TERM --kill-after=5s 60s sh scripts/test-installers.sh
+      - name: Test PowerShell installer verification and replacement
+        run: timeout --signal=TERM --kill-after=5s 60s pwsh -NoProfile -File scripts/test-installers.ps1

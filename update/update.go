@@ -10,7 +10,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,13 +25,20 @@ var ErrRestartRequired = errors.New("update installed; restart required")
 
 var (
 	CurrentVersion string = "0.0.1"
-	Repo           string = "komari-monitor/komari-agent"
+	Repo           string = "R1ddle1337/komari-agent"
 )
 
 const (
 	snapshotVersionPrefix = "Snapshot-"
 	containerMarkerPath   = "/.komari-agent-container"
 	githubAPIBaseURL      = "https://api.github.com"
+)
+
+var (
+	repoOwnerPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]*$`)
+	repoNamePattern  = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
+	snapshotPattern  = regexp.MustCompile(`^Snapshot-([0-9]{10}|[0-9]{12}-[0-9]+-[0-9]+)$`)
+	checksumPattern  = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 type buildTrack int
@@ -64,10 +73,11 @@ type snapshotReleaseCandidate struct {
 	HTMLURL     string
 	PublishedAt time.Time
 	Asset       githubReleaseAsset
+	Checksum    githubReleaseAsset
 }
 
 type selfUpdater interface {
-	UpdateSelf(current semver.Version, slug string) (*selfupdate.Release, error)
+	DetectLatest(slug string) (*selfupdate.Release, bool, error)
 	UpdateTo(release *selfupdate.Release, cmdPath string) error
 }
 
@@ -116,7 +126,10 @@ func selectLatestSnapshotRelease(releases []githubRelease, assetName string) (sn
 	found := false
 
 	for _, release := range releases {
-		if release.Draft || !release.Prerelease || !strings.HasPrefix(release.TagName, snapshotVersionPrefix) {
+		if release.Draft || !release.Prerelease {
+			continue
+		}
+		if _, err := parseSnapshotVersion(release.TagName); err != nil {
 			continue
 		}
 
@@ -124,6 +137,7 @@ func selectLatestSnapshotRelease(releases []githubRelease, assetName string) (sn
 		if !ok {
 			continue
 		}
+		checksum, _ := findReleaseAsset(release, assetName+".sha256")
 
 		candidate := snapshotReleaseCandidate{
 			TagName:     release.TagName,
@@ -132,11 +146,11 @@ func selectLatestSnapshotRelease(releases []githubRelease, assetName string) (sn
 			HTMLURL:     release.HTMLURL,
 			PublishedAt: release.PublishedAt,
 			Asset:       asset,
+			Checksum:    checksum,
 		}
 
-		if !found ||
-			candidate.PublishedAt.After(latest.PublishedAt) ||
-			(candidate.PublishedAt.Equal(latest.PublishedAt) && candidate.TagName > latest.TagName) {
+		// 按构建标签排序，重新发布旧版本不能让客户端回退。
+		if !found || snapshotNeedsUpdate(latest.TagName, candidate) {
 			latest = candidate
 			found = true
 		}
@@ -146,7 +160,49 @@ func selectLatestSnapshotRelease(releases []githubRelease, assetName string) (sn
 }
 
 func snapshotNeedsUpdate(currentVersion string, latest snapshotReleaseCandidate) bool {
-	return currentVersion != latest.TagName
+	current, currentErr := parseSnapshotVersion(currentVersion)
+	next, nextErr := parseSnapshotVersion(latest.TagName)
+	return currentErr == nil && nextErr == nil && next.After(current)
+}
+
+type snapshotBuildVersion struct {
+	createdAt time.Time
+	runID     uint64
+	attempt   uint64
+}
+
+func (v snapshotBuildVersion) After(other snapshotBuildVersion) bool {
+	if !v.createdAt.Equal(other.createdAt) {
+		return v.createdAt.After(other.createdAt)
+	}
+	if v.runID != other.runID {
+		return v.runID > other.runID
+	}
+	return v.attempt > other.attempt
+}
+
+func parseSnapshotVersion(version string) (snapshotBuildVersion, error) {
+	var result snapshotBuildVersion
+	if !snapshotPattern.MatchString(version) {
+		return result, fmt.Errorf("invalid snapshot version %q", version)
+	}
+	parts := strings.Split(strings.TrimPrefix(version, snapshotVersionPrefix), "-")
+	layout := "0601021504"
+	if len(parts) == 3 {
+		layout = "060102150405"
+		var err error
+		result.runID, err = strconv.ParseUint(parts[1], 10, 64)
+		if err != nil || result.runID == 0 {
+			return result, fmt.Errorf("invalid snapshot run ID in %q", version)
+		}
+		result.attempt, err = strconv.ParseUint(parts[2], 10, 64)
+		if err != nil || result.attempt == 0 {
+			return result, fmt.Errorf("invalid snapshot run attempt in %q", version)
+		}
+	}
+	var err error
+	result.createdAt, err = time.Parse(layout, parts[0])
+	return result, err
 }
 
 func isContainerAgent() bool {
@@ -156,10 +212,53 @@ func isContainerAgent() bool {
 
 func splitRepoSlug(slug string) (string, string, error) {
 	parts := strings.Split(slug, "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+	if len(parts) != 2 || !repoOwnerPattern.MatchString(parts[0]) || !repoNamePattern.MatchString(parts[1]) {
 		return "", "", fmt.Errorf("invalid repo slug %q, expected owner/name", slug)
 	}
 	return parts[0], parts[1], nil
+}
+
+func validateAssetURL(assetURL, owner, repo, assetName, tag string) error {
+	u, err := url.Parse(assetURL)
+	if err != nil || u.Scheme != "https" || u.Host != "github.com" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("untrusted update asset URL %q", assetURL)
+	}
+	parts := strings.Split(strings.TrimPrefix(u.Path, "/"), "/")
+	if len(parts) != 6 || !strings.EqualFold(parts[0], owner) || !strings.EqualFold(parts[1], repo) ||
+		parts[2] != "releases" || parts[3] != "download" || parts[4] == "" || parts[4] == "." || parts[4] == ".." ||
+		parts[5] != assetName || (tag != "" && parts[4] != tag) {
+		return fmt.Errorf("update asset must belong to %s/%s and match %s", owner, repo, assetName)
+	}
+	return nil
+}
+
+func validateUpdateRelease(release *selfupdate.Release, owner, repo string) error {
+	if release == nil || !strings.EqualFold(release.RepoOwner, owner) || !strings.EqualFold(release.RepoName, repo) {
+		return fmt.Errorf("update release must belong to %s/%s", owner, repo)
+	}
+	if release.AssetID <= 0 || release.ValidationAssetID <= 0 {
+		return errors.New("update release is missing its binary or SHA256 checksum asset")
+	}
+	return validateAssetURL(release.AssetURL, owner, repo, expectedAssetName(runtime.GOOS, runtime.GOARCH), "")
+}
+
+// 依赖库的 SHA2Validator 会直接读取前 64 字节；先检查格式，避免损坏文件导致 panic。
+type checksumValidator struct {
+	selfupdate.SHA2Validator
+}
+
+func (v *checksumValidator) Validate(binary, checksum []byte) error {
+	if len(checksum) < 64 || !checksumPattern.Match(checksum[:64]) {
+		return errors.New("invalid SHA256 checksum file")
+	}
+	return v.SHA2Validator.Validate(binary, checksum)
+}
+
+func updaterConfig() selfupdate.Config {
+	return selfupdate.Config{
+		Validator: &checksumValidator{},
+		Filters:   []string{"^" + regexp.QuoteMeta(expectedAssetName(runtime.GOOS, runtime.GOARCH)) + "$"},
+	}
 }
 
 func listGitHubReleases(owner, repo string) ([]githubRelease, error) {
@@ -240,7 +339,7 @@ func selfUpdateReleaseFromSnapshot(owner, repo string, candidate snapshotRelease
 		AssetURL:          candidate.Asset.BrowserDownloadURL,
 		AssetByteSize:     candidate.Asset.Size,
 		AssetID:           candidate.Asset.ID,
-		ValidationAssetID: -1,
+		ValidationAssetID: candidate.Checksum.ID,
 		URL:               candidate.HTMLURL,
 		ReleaseNotes:      candidate.Body,
 		Name:              candidate.Name,
@@ -268,27 +367,33 @@ func runScheduledUpdates(ticks <-chan time.Time, check func() error, onRestartRe
 }
 
 func checkAndUpdateStable(currentSemVer semver.Version, updater selfUpdater) error {
-	latest, err := updater.UpdateSelf(currentSemVer, Repo)
+	owner, repo, err := splitRepoSlug(Repo)
 	if err != nil {
-		return fmt.Errorf("failed to check for updates: %v", err)
+		return err
+	}
+	latest, found, err := updater.DetectLatest(Repo)
+	if err != nil {
+		return fmt.Errorf("failed to check for updates: %w", err)
 	}
 
-	if latest.Version.Equals(currentSemVer) {
-		log.Println("Current version is the latest:", CurrentVersion)
+	if !found {
+		log.Println("No stable release was found in", Repo)
 		return nil
 	}
-	// Default is installed as a service, so don't automatically restart
-	//execPath, err := os.Executable()
-	//if err != nil {
-	//	return fmt.Errorf("failed to get current executable path: %v", err)
-	//}
-
-	// _, err = os.StartProcess(execPath, os.Args, &os.ProcAttr{
-	// 	Files: []*os.File{os.Stdin, os.Stdout, os.Stderr},
-	// })
-	// if err != nil {
-	// 	return fmt.Errorf("failed to restart program: %v", err)
-	// }
+	if err := validateUpdateRelease(latest, owner, repo); err != nil {
+		return err
+	}
+	if !needUpdate(currentSemVer, latest.Version) {
+		log.Println("Current version is the latest or newer:", CurrentVersion)
+		return nil
+	}
+	cmdPath, err := currentExecutablePath()
+	if err != nil {
+		return fmt.Errorf("failed to resolve current executable path: %w", err)
+	}
+	if err := updater.UpdateTo(latest, cmdPath); err != nil {
+		return fmt.Errorf("failed to update to version %s: %w", latest.Version, err)
+	}
 	log.Printf("Successfully updated to version %s\n", latest.Version)
 	return ErrRestartRequired
 }
@@ -301,6 +406,9 @@ func checkAndUpdateSnapshot(updater selfUpdater, listReleases releaseLister, isC
 
 	owner, repo, err := splitRepoSlug(Repo)
 	if err != nil {
+		return err
+	}
+	if _, err := parseSnapshotVersion(CurrentVersion); err != nil {
 		return err
 	}
 
@@ -317,8 +425,18 @@ func checkAndUpdateSnapshot(updater selfUpdater, listReleases releaseLister, isC
 	}
 
 	if !snapshotNeedsUpdate(CurrentVersion, latest) {
-		log.Println("Current snapshot version is the latest:", CurrentVersion)
+		log.Println("Current snapshot version is the latest or newer:", CurrentVersion)
 		return nil
+	}
+	release := selfUpdateReleaseFromSnapshot(owner, repo, latest)
+	if err := validateUpdateRelease(release, owner, repo); err != nil {
+		return err
+	}
+	if err := validateAssetURL(latest.Asset.BrowserDownloadURL, owner, repo, assetName, latest.TagName); err != nil {
+		return err
+	}
+	if err := validateAssetURL(latest.Checksum.BrowserDownloadURL, owner, repo, assetName+".sha256", latest.TagName); err != nil {
+		return err
 	}
 
 	cmdPath, err := currentExecutablePath()
@@ -327,7 +445,7 @@ func checkAndUpdateSnapshot(updater selfUpdater, listReleases releaseLister, isC
 	}
 
 	log.Printf("Will update %s from snapshot %s to %s\n", cmdPath, CurrentVersion, latest.TagName)
-	if err := updater.UpdateTo(selfUpdateReleaseFromSnapshot(owner, repo, latest), cmdPath); err != nil {
+	if err := updater.UpdateTo(release, cmdPath); err != nil {
 		return fmt.Errorf("failed to update to snapshot %s: %w", latest.TagName, err)
 	}
 
@@ -338,9 +456,12 @@ func checkAndUpdateSnapshot(updater selfUpdater, listReleases releaseLister, isC
 // 检查更新并执行自动更新
 func CheckAndUpdate() error {
 	log.Println("Checking update...")
+	if _, _, err := splitRepoSlug(Repo); err != nil {
+		return err
+	}
 
 	http.DefaultClient = dnsresolver.GetHTTPClient(60 * time.Second)
-	updater, err := selfupdate.NewUpdater(selfupdate.Config{})
+	updater, err := selfupdate.NewUpdater(updaterConfig())
 	if err != nil {
 		return fmt.Errorf("failed to create updater: %v", err)
 	}

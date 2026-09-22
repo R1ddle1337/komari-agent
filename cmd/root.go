@@ -30,9 +30,10 @@ var flags = pkg_flags.GlobalConfig
 var warningPanelHost, warningRunAsUser string
 
 var RootCmd = &cobra.Command{
-	Use:   "komari-agent",
-	Short: "komari agent",
-	Long:  `komari agent`,
+	Use:     "komari-agent",
+	Short:   "komari agent",
+	Long:    `komari agent`,
+	Version: update.CurrentVersion + " (" + update.Repo + ")",
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// Notification helpers must not load the service's config or credentials.
 		if flags.ShowWarning {

@@ -1,0 +1,165 @@
+name: Build and Publish Owned Release
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        required: true
+        type: string
+      version:
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: github.repository == 'R1ddle1337/komari-agent' && github.ref == 'refs/heads/owned'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate reviewed source and release version
+        id: version
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          owned_sha="$(git ls-remote origin refs/heads/owned | cut -f1)"
+          test "$owned_sha" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          case "$CHANNEL" in
+            stable)
+              if ! [[ "$INPUT_VERSION" =~ ^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+                echo "Stable version must be an unambiguous SemVer tag." >&2
+                exit 1
+              fi
+              version="$INPUT_VERSION"
+              ;;
+            snapshot)
+              version="Snapshot-$(date -u +%y%m%d%H%M%S)-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+              ;;
+            *) echo "Unsupported release channel." >&2; exit 1 ;;
+          esac
+          if [ -n "$(git ls-remote origin "refs/tags/$version")" ]; then
+            echo "Existing tags are immutable; select a new version." >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: prepare
+    uses: ./.github/workflows/test.yml
+
+  build:
+    needs: [prepare, test]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        goos: [windows, linux, darwin, freebsd]
+        goarch: [amd64, arm64, "386", arm]
+        exclude:
+          - {goos: windows, goarch: arm}
+          - {goos: darwin, goarch: "386"}
+          - {goos: darwin, goarch: arm}
+        include:
+          - {goos: linux, goarch: loong64}
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.8"
+          cache: false
+      - name: Build and checksum release binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          go mod download
+          go mod verify
+          binary="komari-agent-${GOOS}-${GOARCH}"
+          if [ "$GOOS" = windows ]; then binary="$binary.exe"; fi
+          go build -trimpath -ldflags="-s -w -X github.com/komari-monitor/komari-agent/update.CurrentVersion=$VERSION -X github.com/komari-monitor/komari-agent/update.Repo=$GITHUB_REPOSITORY" -o "$binary"
+          sha256sum "$binary" > "$binary.sha256"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-komari-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: komari-agent-*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [prepare, test, build]
+    if: github.repository == 'R1ddle1337/komari-agent' && github.ref == 'refs/heads/owned'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release-komari-agent-*
+          path: artifacts
+          merge-multiple: true
+      - name: Verify complete artifacts and publish atomically
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          CHANNEL: ${{ inputs.channel }}
+        run: |
+          set -euo pipefail
+          owned_sha="$(git ls-remote origin refs/heads/owned | cut -f1)"
+          test "$owned_sha" = "$GITHUB_SHA"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          if [ -n "$(git ls-remote origin "refs/tags/$VERSION")" ]; then
+            echo "Refusing to overwrite an existing tag." >&2
+            exit 1
+          fi
+          (
+            cd artifacts
+            binaries=(komari-agent-*)
+            test "${#binaries[@]}" -eq 28
+            checksums=(*.sha256)
+            test "${#checksums[@]}" -eq 14
+            sha256sum --strict --check -- *.sha256
+          )
+          prerelease=false
+          latest=true
+          if [ "$CHANNEL" = snapshot ]; then prerelease=true; latest=false; fi
+          gh release create "$VERSION" artifacts/komari-agent-* \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --draft --prerelease="$prerelease" --latest=false \
+            --title "$VERSION" \
+            --notes "Owned build from commit $GITHUB_SHA. Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. SHA-256 checksums accompany every binary."
+          gh release edit "$VERSION" --repo "$GITHUB_REPOSITORY" \
+            --draft=false --prerelease="$prerelease" --latest="$latest"
+
+  docker:
+    needs: [prepare, test, publish]
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/release-docker.yml
+    with:
+      version: ${{ needs.prepare.outputs.version }}
+      channel: ${{ inputs.channel }}

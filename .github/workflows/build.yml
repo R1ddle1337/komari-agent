@@ -1,53 +1,61 @@
-name: Build on Main
+name: Build Owned Agent
 
 on:
   push:
-    branches:
-      - main
+    branches: [owned]
+  pull_request:
+    branches: [owned]
+
+permissions:
+  contents: read
 
 jobs:
+  test:
+    if: github.repository == 'R1ddle1337/komari-agent'
+    uses: ./.github/workflows/test.yml
+
   build:
-    runs-on: ubuntu-latest
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        exclude:
-          - goos: windows
-            goarch: arm
-          - goos: darwin
-            goarch: 386
-          - goos: darwin
-            goarch: arm
-        include:
-          - goos: linux
-            goarch: loong64
         goos: [windows, linux, darwin, freebsd]
-        goarch: [amd64, arm64, 386, arm]
-
+        goarch: [amd64, arm64, "386", arm]
+        exclude:
+          - {goos: windows, goarch: arm}
+          - {goos: darwin, goarch: "386"}
+          - {goos: darwin, goarch: arm}
+        include:
+          - {goos: linux, goarch: loong64}
+    env:
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          go-version: "1.23"
-
-      - name: Build binary
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.8"
+          cache: false
+      - name: Build verification artifact
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: 0
-          VERSION: ${{ github.sha }}
+          CGO_ENABLED: "0"
         run: |
-          BINARY_NAME=komari-agent-${{ matrix.goos }}-${{ matrix.goarch }}
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            BINARY_NAME=${BINARY_NAME}.exe
-          fi
-          go build -trimpath -ldflags="-X github.com/komari-monitor/komari-agent/update.CurrentVersion=${VERSION}" -o $BINARY_NAME
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+          set -euo pipefail
+          go mod download
+          go mod verify
+          binary="komari-agent-${GOOS}-${GOARCH}"
+          if [ "$GOOS" = windows ]; then binary="$binary.exe"; fi
+          version="0.0.0-dev+${GITHUB_SHA}"
+          go build -trimpath -ldflags="-s -w -X github.com/komari-monitor/komari-agent/update.CurrentVersion=$version -X github.com/komari-monitor/komari-agent/update.Repo=$GITHUB_REPOSITORY" -o "$binary"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: komari-agent-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: komari-agent-${{ matrix.goos }}-${{ matrix.goarch }}*
+          name: ci-komari-agent-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: komari-agent-*
+          if-no-files-found: error
+          retention-days: 7

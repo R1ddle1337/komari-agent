@@ -1,63 +1,40 @@
-name: Generate Release Notes
+name: Regenerate Owned Release Notes
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to regenerate notes for."
+        description: "Existing owned release tag"
         required: true
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   update-release-notes:
-    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
-    runs-on: ubuntu-latest
-
+    if: github.repository == 'R1ddle1337/komari-agent' && github.ref == 'refs/heads/owned'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
     steps:
-      - name: Generate and apply release notes
-        uses: actions/github-script@v9
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          script: |
-            const tag = context.payload.release?.tag_name || core.getInput("tag");
-            if (!tag) {
-              core.setFailed("No release tag was provided.");
-              return;
-            }
-
-            const { owner, repo } = context.repo;
-            const release = context.payload.release?.tag_name === tag
-              ? context.payload.release
-              : (await github.rest.repos.getReleaseByTag({ owner, repo, tag })).data;
-
-            const generated = await github.request(
-              "POST /repos/{owner}/{repo}/releases/generate-notes",
-              {
-                owner,
-                repo,
-                tag_name: tag,
-                target_commitish: release.target_commitish || undefined,
-              },
-            );
-
-            const body = generated.data.body?.trim();
-            if (!body) {
-              core.setFailed(`GitHub returned empty release notes for ${tag}.`);
-              return;
-            }
-
-            await github.rest.repos.updateRelease({
-              owner,
-              repo,
-              release_id: release.id,
-              body,
-            });
-
-            await core.summary
-              .addHeading("Release Notes")
-              .addRaw(`Updated release notes for ${tag}.`)
-              .write();
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate owned tag and regenerate notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ || "$TAG" =~ ^Snapshot-[0-9]{12}-[0-9]+-[0-9]+$ ]]
+          git fetch --no-tags origin owned "refs/tags/$TAG:refs/tags/$TAG"
+          tag_sha="$(git rev-parse "refs/tags/$TAG^{commit}")"
+          git merge-base --is-ancestor "$tag_sha" origin/owned
+          gh api --method POST "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f "tag_name=$TAG" -f "target_commitish=$tag_sha" --jq .body > generated-notes.md
+          printf '\n\nOwned build from commit %s. SHA-256 checksums accompany every binary.\n' "$tag_sha" >> generated-notes.md
+          test -s generated-notes.md
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file generated-notes.md

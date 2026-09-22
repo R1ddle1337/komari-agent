@@ -1,4 +1,4 @@
-# Windows PowerShell installation script for Komari Agent
+﻿# Windows PowerShell installation script for Komari Agent
 
 # Logging functions with colors
 function Log-Info { param([string]$Message) Write-Host "$Message"    -ForegroundColor Cyan }
@@ -14,6 +14,7 @@ $ServiceName = "komari-agent"
 $GitHubProxy = ""
 $KomariArgs = @()
 $InstallVersion = ""
+$ReleaseRepository = "R1ddle1337/komari-agent"
 
 # Parse script arguments
 for ($i = 0; $i -lt $args.Count; $i++) {
@@ -34,7 +35,15 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 }
 
 # Prepare GitHub proxy display
-if ($GitHubProxy -ne '') { $ProxyDisplay = $GitHubProxy } else { $ProxyDisplay = '(direct)' }
+if ($GitHubProxy -ne '') {
+    if ($GitHubProxy -notmatch '^https://') {
+        Log-Error "GitHub proxy must use HTTPS."
+        exit 1
+    }
+    $GitHubProxy = $GitHubProxy.TrimEnd('/')
+    $ProxyDisplay = $GitHubProxy
+    Log-Warning "The explicitly selected proxy can replace both binaries and checksums. Use only a proxy you trust."
+} else { $ProxyDisplay = '(direct)' }
 
 # Detect architecture early for constructing binary name
 switch ($env:PROCESSOR_ARCHITECTURE) {
@@ -91,16 +100,23 @@ if (-not $nssmCmd) {
     Log-Info "nssm not found or not usable. Attempting to download to $InstallDir..."
     $NssmVersion = "2.24"
     $NssmZipUrl = "https://nssm.cc/release/nssm-$NssmVersion.zip"
-    $TempNssmZipPath = Join-Path $env:TEMP "nssm-$NssmVersion.zip"
-    $TempExtractDir = Join-Path $env:TEMP "nssm_extract_temp"
+    # 固定官方 2.24 压缩包哈希，在解压或执行之前验证。
+    $NssmZipSha256 = "727d1e42275c605e0f04aba98095c38a8e1e46def453cdffce42869428aa6743"
+    $NssmTempParent = [IO.Path]::GetFullPath($env:TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $NssmTempRoot = Join-Path $NssmTempParent ("komari-nssm-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $NssmTempRoot -ErrorAction Stop | Out-Null
+    $TempNssmZipPath = Join-Path $NssmTempRoot "nssm-$NssmVersion.zip"
+    $TempExtractDir = Join-Path $NssmTempRoot "extracted"
 
     try {
         Log-Info "Downloading nssm from $NssmZipUrl..."
-        Invoke-WebRequest -Uri $NssmZipUrl -OutFile $TempNssmZipPath -UseBasicParsing
+        Invoke-WebRequest -Uri $NssmZipUrl -OutFile $TempNssmZipPath -UseBasicParsing -TimeoutSec 120 -ErrorAction Stop
+        if ((Get-FileHash -LiteralPath $TempNssmZipPath -Algorithm SHA256 -ErrorAction Stop).Hash -ine $NssmZipSha256) {
+            throw "NSSM archive SHA256 verification failed."
+        }
 
-        if (Test-Path $TempExtractDir) { Remove-Item -Recurse -Force $TempExtractDir }
-        New-Item -ItemType Directory -Path $TempExtractDir -Force | Out-Null
-        Expand-Archive -Path $TempNssmZipPath -DestinationPath $TempExtractDir -Force
+        New-Item -ItemType Directory -Path $TempExtractDir -ErrorAction Stop | Out-Null
+        Expand-Archive -LiteralPath $TempNssmZipPath -DestinationPath $TempExtractDir -ErrorAction Stop
         
         $NssmSourceDirInsideZip = "nssm-$NssmVersion" # Used for Get-ChildItem search path
         # The path part within the extracted nssm folder, e.g., "nssm-2.24\win32"
@@ -142,8 +158,13 @@ if (-not $nssmCmd) {
         exit 1
     }
     finally {
-        if (Test-Path $TempNssmZipPath) { Remove-Item $TempNssmZipPath -Force -ErrorAction SilentlyContinue }
-        if (Test-Path $TempExtractDir) { Remove-Item $TempExtractDir -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $NssmTempRoot) {
+            $ResolvedNssmTempRoot = (Resolve-Path -LiteralPath $NssmTempRoot).Path
+            if ((Split-Path -Parent $ResolvedNssmTempRoot) -eq $NssmTempParent -and
+                (Split-Path -Leaf $ResolvedNssmTempRoot) -match '^komari-nssm-[a-f0-9]{32}$') {
+                Remove-Item -LiteralPath $ResolvedNssmTempRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
     }
 }
 
@@ -160,6 +181,7 @@ Log-Step "Installation configuration:"
 Log-Config "Service name: $ServiceName"
 Log-Config "Install directory: $InstallDir"
 Log-Config "GitHub proxy: $ProxyDisplay"
+Log-Config "Release repository: $ReleaseRepository"
 Log-Config "Agent arguments: $($KomariArgs -join ' ')"
 if ($InstallVersion -ne "") {
     Log-Config "Specified agent version: $InstallVersion"
@@ -199,17 +221,32 @@ function Uninstall-Previous {
         }
     }
 
-    if (Test-Path $AgentPath) {
-        Log-Warning "Removing old binary..."
-        Remove-Item $AgentPath -Force
+    # 保留旧二进制，验证成功后才使用新文件替换。
+}
+
+function Assert-AssetChecksum {
+    param(
+        [Parameter(Mandatory = $true)][string]$BinaryPath,
+        [Parameter(Mandatory = $true)][string]$ChecksumPath,
+        [Parameter(Mandatory = $true)][string]$AssetName
+    )
+
+    $ChecksumText = Get-Content -LiteralPath $ChecksumPath -Raw -ErrorAction Stop
+    $ChecksumPattern = '\A([0-9a-fA-F]{64})[ \t]+\*?' + [regex]::Escape($AssetName) + '(?:\r?\n)?\z'
+    $ChecksumMatch = [regex]::Match($ChecksumText, $ChecksumPattern)
+    if (-not $ChecksumMatch.Success) {
+        throw "Invalid SHA256 record for $AssetName."
+    }
+    $ActualHash = (Get-FileHash -LiteralPath $BinaryPath -Algorithm SHA256 -ErrorAction Stop).Hash
+    if ($ActualHash -ine $ChecksumMatch.Groups[1].Value) {
+        throw "SHA256 verification failed for $AssetName."
     }
 }
-Uninstall-Previous
 
 function Get-LatestSnapshotVersion {
     param([Parameter(Mandatory = $true)][string]$AssetName)
 
-    $ApiUrl = "https://api.github.com/repos/komari-monitor/komari-agent/releases?per_page=100"
+    $ApiUrl = "https://api.github.com/repos/$ReleaseRepository/releases?per_page=100"
     $ApiUrls = @($ApiUrl)
     if ($GitHubProxy -ne "") {
         $ApiUrls = @("$GitHubProxy/$ApiUrl", $ApiUrl)
@@ -218,7 +255,7 @@ function Get-LatestSnapshotVersion {
     for ($i = 0; $i -lt $ApiUrls.Count; $i++) {
         try {
             Log-Info "Fetching snapshot releases from GitHub API..."
-            $releases = Invoke-RestMethod -Uri $ApiUrls[$i] -UseBasicParsing
+            $releases = Invoke-RestMethod -Uri $ApiUrls[$i] -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
         }
         catch {
             $releases = $null
@@ -230,7 +267,8 @@ function Get-LatestSnapshotVersion {
                 $_.draft -eq $false -and
                 $_.prerelease -eq $true -and
                 $_.tag_name -like "Snapshot-*" -and
-                (@($_.assets.name) -contains $AssetName)
+                (@($_.assets.name) -contains $AssetName) -and
+                (@($_.assets.name) -contains "$AssetName.sha256")
             } |
             Sort-Object -Property @{ Expression = { [datetime]$_.published_at }; Descending = $true }, @{ Expression = { $_.tag_name }; Descending = $true } |
             Select-Object -First 1
@@ -249,7 +287,7 @@ function Get-LatestSnapshotVersion {
 }
 
 $versionToInstall = ""
-if ($InstallVersion -ne "") {
+if ($InstallVersion -ne "" -and $InstallVersion -ine "latest") {
     Log-Info "Attempting to install specified version: $InstallVersion"
     if ($InstallVersion -ieq "snapshot") {
         Log-Info "Resolving the latest snapshot version..."
@@ -267,10 +305,20 @@ if ($InstallVersion -ne "") {
     }
 }
 else {
-    $ApiUrl = "https://api.github.com/repos/komari-monitor/komari-agent/releases/latest"
+    $ApiUrl = "https://api.github.com/repos/$ReleaseRepository/releases/latest"
     try {
         Log-Step "Fetching latest release version from GitHub API..."
-        $release = Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing
+        if ($GitHubProxy) {
+            try {
+                $release = Invoke-RestMethod -Uri "$GitHubProxy/$ApiUrl" -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+            }
+            catch {
+                Log-Warning "Failed to resolve latest release through GitHub proxy, retrying directly."
+                $release = Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+            }
+        } else {
+            $release = Invoke-RestMethod -Uri $ApiUrl -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+        }
         $versionToInstall = $release.tag_name
         Log-Success "Latest version fetched: $versionToInstall"
     }
@@ -279,21 +327,46 @@ else {
         exit 1
     }
 }
+if ($versionToInstall -cnotmatch '^[A-Za-z0-9_+-][A-Za-z0-9._+-]*$') {
+    Log-Error "Invalid release tag: $versionToInstall"
+    exit 1
+}
 Log-Success "Installing Komari Agent version: $versionToInstall"
 
 # Construct download URL
 $BinaryName = "komari-agent-windows-$arch.exe"
-$DownloadUrl = if ($GitHubProxy) { "$GitHubProxy/https://github.com/komari-monitor/komari-agent/releases/download/$versionToInstall/$BinaryName" } else { "https://github.com/komari-monitor/komari-agent/releases/download/$versionToInstall/$BinaryName" }
+$DownloadUrl = if ($GitHubProxy) { "$GitHubProxy/https://github.com/$ReleaseRepository/releases/download/$versionToInstall/$BinaryName" } else { "https://github.com/$ReleaseRepository/releases/download/$versionToInstall/$BinaryName" }
 
 # Download and install
 New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 Log-Info "URL: $DownloadUrl"
+$StageDir = Join-Path $InstallDir (".komari-install-" + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $StageDir -ErrorAction Stop | Out-Null
+$StagedBinary = Join-Path $StageDir $BinaryName
+$StagedChecksum = Join-Path $StageDir "$BinaryName.sha256"
 try {
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $AgentPath -UseBasicParsing
+    # 下载和校验全部完成前，不停止旧服务、不覆盖旧二进制。
+    Invoke-WebRequest -Uri $DownloadUrl -OutFile $StagedBinary -UseBasicParsing -TimeoutSec 300 -ErrorAction Stop
+    if ((Get-Item -LiteralPath $StagedBinary -ErrorAction Stop).Length -eq 0) {
+        throw "Downloaded agent binary is empty."
+    }
+    Invoke-WebRequest -Uri "$DownloadUrl.sha256" -OutFile $StagedChecksum -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+    Assert-AssetChecksum -BinaryPath $StagedBinary -ChecksumPath $StagedChecksum -AssetName $BinaryName
+    Log-Success "SHA256 verification passed."
+    Uninstall-Previous
+    if (Test-Path -LiteralPath $AgentPath) {
+        [IO.File]::Replace($StagedBinary, $AgentPath, [NullString]::Value)
+    } else {
+        [IO.File]::Move($StagedBinary, $AgentPath)
+    }
 }
 catch {
-    Log-Error "Download failed: $_"
+    Log-Error "Download, verification, or replacement failed: $_"
     exit 1
+}
+finally {
+    Remove-Item -LiteralPath $StagedBinary, $StagedChecksum -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $StageDir -Force -ErrorAction SilentlyContinue
 }
 Log-Success "Downloaded and saved to $AgentPath"
 

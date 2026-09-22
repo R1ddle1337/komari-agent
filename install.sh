@@ -44,7 +44,7 @@ target_dir="/opt/komari"
 github_proxy=""
 install_version="" # New parameter for specifying version
 install_dir_specified=false
-install_no_mirror=false # 关闭自动加速镜像
+release_repository="R1ddle1337/komari-agent"
 service_user="${SUDO_USER:-$(id -un)}"
 user_service=false
 
@@ -98,8 +98,7 @@ while [ $# -gt 0 ]; do
             install_version="$2"
             shift 2
             ;;
-        --install-no-mirror) # 新增: 关闭自动加速镜像
-            install_no_mirror=true
+        --install-no-mirror) # 默认已禁用自动镜像，保留原有安装参数。
             shift
             ;;
         --install*)
@@ -148,6 +147,14 @@ log_config "  Service name: ${GREEN}$service_name${NC}"
 log_config "  Service user: ${GREEN}$service_user${NC}"
 log_config "  Install directory: ${GREEN}$target_dir${NC}"
 log_config "  GitHub proxy: ${GREEN}${github_proxy:-(direct)}${NC}"
+log_config "  Release repository: ${GREEN}$release_repository${NC}"
+if [ -n "$github_proxy" ]; then
+    case "$github_proxy" in
+        https://*) github_proxy=${github_proxy%/} ;;
+        *) log_error "GitHub proxy must use HTTPS"; exit 1 ;;
+    esac
+    log_warning "The explicitly selected proxy can replace both binaries and checksums. Use only a proxy you trust."
+fi
 log_config "  Binary arguments: ${GREEN}$komari_args${NC}"
 if [ -n "$install_version" ]; then
     log_config "  Specified agent version: ${GREEN}$install_version${NC}"
@@ -207,15 +214,8 @@ uninstall_previous() {
         fi
     fi
     
-    # Remove old binary if it exists
-    if [ -f "$komari_agent_path" ]; then
-        log_info "Removing old binary..."
-        rm -f "$komari_agent_path"
-    fi
+    # 二进制由验证后的临时文件原子替换，不能预先删除。
 }
-
-# Uninstall previous installation
-uninstall_previous
 
 install_dependencies() {
     log_step "Checking and installing dependencies..."
@@ -320,9 +320,12 @@ esac
 log_info "Detected OS: ${GREEN}$os_name${NC}, Architecture: ${GREEN}$arch${NC}"
 
 file_name="komari-agent-${os_name}-${arch}"
+if [ "$os_name" = "windows" ]; then
+    file_name="${file_name}.exe"
+fi
 
 resolve_snapshot_version() {
-    snapshot_api_url="https://api.github.com/repos/komari-monitor/komari-agent/releases?per_page=100"
+    snapshot_api_url="https://api.github.com/repos/${release_repository}/releases?per_page=100"
     if [ -n "$github_proxy" ]; then
         snapshot_api_urls="${github_proxy}/${snapshot_api_url} ${snapshot_api_url}"
     else
@@ -330,7 +333,7 @@ resolve_snapshot_version() {
     fi
 
     for api_url in $snapshot_api_urls; do
-        if ! releases_json=$(curl -fsSL --connect-timeout 15 \
+        if ! releases_json=$(curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 60 \
             -H "Accept: application/vnd.github+json" \
             -H "User-Agent: komari-agent-installer" \
             "$api_url"); then
@@ -356,6 +359,64 @@ resolve_snapshot_version() {
     return 1
 }
 
+resolve_latest_version() {
+    latest_api_url="https://api.github.com/repos/${release_repository}/releases/latest"
+    if [ -n "$github_proxy" ]; then
+        latest_api_urls="${github_proxy}/${latest_api_url} ${latest_api_url}"
+    else
+        latest_api_urls="$latest_api_url"
+    fi
+
+    for api_url in $latest_api_urls; do
+        if release_json=$(curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 60 \
+            -H "Accept: application/vnd.github+json" \
+            -H "User-Agent: komari-agent-installer" "$api_url"); then
+            RESOLVED_LATEST_VERSION=$(printf '%s\n' "$release_json" |
+                grep -o '"tag_name":[[:space:]]*"[^"]*"' |
+                head -n 1 | sed 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/')
+            if [ -n "$RESOLVED_LATEST_VERSION" ]; then
+                return 0
+            fi
+        fi
+        if [ "$api_url" != "$latest_api_url" ]; then
+            log_warning "Failed to resolve latest release through GitHub proxy, retrying directly."
+        fi
+    done
+    return 1
+}
+
+# 不执行校验文件内容，只接受一个与目标文件名完全匹配的 SHA256 记录。
+verify_asset_checksum() {
+    checksum_binary=$1
+    checksum_file=$2
+    checksum_name=$3
+    expected_checksum=$(LC_ALL=C awk -v name="$checksum_name" '
+        { sub(/\r$/, "") }
+        NF == 2 && length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ && ($2 == name || $2 == "*" name) {
+            count++; hash = tolower($1); next
+        }
+        { invalid = 1 }
+        END { if (count != 1 || invalid) exit 1; print hash }
+    ' "$checksum_file") || return 1
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        actual_checksum=$(sha256sum "$checksum_binary") || return 1
+    elif command -v shasum >/dev/null 2>&1; then
+        actual_checksum=$(shasum -a 256 "$checksum_binary") || return 1
+    elif command -v sha256 >/dev/null 2>&1; then
+        actual_checksum=$(sha256 -q "$checksum_binary") || return 1
+    elif command -v openssl >/dev/null 2>&1; then
+        actual_checksum=$(openssl dgst -sha256 "$checksum_binary") || return 1
+        actual_checksum=${actual_checksum##* }
+    else
+        log_error "SHA256 verification requires sha256sum, shasum, sha256, or openssl."
+        return 1
+    fi
+    actual_checksum=${actual_checksum%% *}
+    actual_checksum=$(printf '%s' "$actual_checksum" | tr 'A-F' 'a-f')
+    [ "$actual_checksum" = "$expected_checksum" ]
+}
+
 version_to_install="latest"
 if [ -n "$install_version" ]; then
     if [ "$install_version" = "snapshot" ]; then
@@ -374,61 +435,64 @@ else
     log_info "No version specified, installing the latest version."
 fi
 
-# Construct download URL
+# 将 latest 固定为具体 tag，避免两次下载跨越不同版本。
 if [ "$version_to_install" = "latest" ]; then
-    download_path="latest/download"
-else
-    download_path="download/${version_to_install}"
+    if ! resolve_latest_version; then
+        log_error "Failed to resolve the latest version from $release_repository."
+        exit 1
+    fi
+    version_to_install="$RESOLVED_LATEST_VERSION"
 fi
+case "$version_to_install" in
+    ""|.*|*[!A-Za-z0-9._+-]*) log_error "Invalid release tag: $version_to_install"; exit 1 ;;
+esac
+download_path="download/${version_to_install}"
 
 if [ -n "$github_proxy" ]; then
     # Use proxy for GitHub releases
-    download_url="${github_proxy}/https://github.com/komari-monitor/komari-agent/releases/${download_path}/${file_name}"
+    download_url="${github_proxy}/https://github.com/${release_repository}/releases/${download_path}/${file_name}"
 else
     # Direct access to GitHub releases
-    download_url="https://github.com/komari-monitor/komari-agent/releases/${download_path}/${file_name}"
+    download_url="https://github.com/${release_repository}/releases/${download_path}/${file_name}"
 fi
 
 log_step "Creating installation directory: ${GREEN}$target_dir${NC}"
-mkdir -p "$target_dir"
+mkdir -p "$target_dir" || exit 1
 if [ "$EUID" -eq 0 ] && [ "$service_user" != "root" ]; then
     chown "$service_user" "$target_dir"
 fi
 
-# Download with automatic mirror fallback.
-# 直连失败自动依次尝试常见 GitHub 加速镜像, 可用 --install-no-mirror 关闭.
-if [ -n "$github_proxy" ] || [ "$install_no_mirror" = "true" ]; then
-    download_urls="$download_url"
-else
-    download_urls="
-${download_url}
-https://ghfast.top/${download_url}
-https://gh-proxy.com/${download_url}
-https://ghproxy.net/${download_url}
-"
-fi
+# 临时目录位于安装目录，校验成功后的替换不会跨文件系统。
+stage_dir=$(mktemp -d "${target_dir}/.komari-install.XXXXXX") || exit 1
+cleanup_download() {
+    rm -f "$stage_dir/$file_name" "$stage_dir/$file_name.sha256"
+    rmdir "$stage_dir" 2>/dev/null || true
+}
+trap cleanup_download EXIT
+trap 'exit 1' HUP INT TERM
 
-dl_ok=""
-for u in $download_urls; do
-    log_step "Downloading $file_name ..."
-    log_info "URL: ${CYAN}$u${NC}"
-    if curl -fL --connect-timeout 15 -o "$komari_agent_path" "$u" && [ -s "$komari_agent_path" ]; then
-        dl_ok=1
-        break
-    fi
-    rm -f "$komari_agent_path"
-done
-
-if [ -z "$dl_ok" ]; then
-    log_error "Download failed from all sources (direct + mirrors)"
-    log_error "Retry later, or specify --install-ghproxy <mirror-prefix> manually"
+log_step "Downloading $file_name from $release_repository ($version_to_install)..."
+log_info "URL: ${CYAN}$download_url${NC}"
+if ! curl -fL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 300 \
+    -o "$stage_dir/$file_name" "$download_url" || [ ! -s "$stage_dir/$file_name" ]; then
+    log_error "Binary download failed; the existing installation has not been stopped or replaced."
     exit 1
 fi
-
-# Set executable permissions
-chmod +x "$komari_agent_path"
+if ! curl -fsSL --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 60 \
+    -o "$stage_dir/$file_name.sha256" "${download_url}.sha256" ||
+    ! verify_asset_checksum "$stage_dir/$file_name" "$stage_dir/$file_name.sha256" "$file_name"; then
+    log_error "SHA256 verification failed or checksum is missing; the existing installation has not been stopped or replaced."
+    exit 1
+fi
+log_success "SHA256 verification passed."
+chmod +x "$stage_dir/$file_name" || exit 1
 if [ "$EUID" -eq 0 ] && [ "$service_user" != "root" ]; then
-    chown "$service_user" "$komari_agent_path"
+    chown "$service_user" "$stage_dir/$file_name" || exit 1
+fi
+uninstall_previous
+if ! mv -f "$stage_dir/$file_name" "$komari_agent_path"; then
+    log_error "Failed to replace the agent binary. Check the existing service before retrying."
+    exit 1
 fi
 log_success "Komari-agent installed to ${GREEN}$komari_agent_path${NC}"
 

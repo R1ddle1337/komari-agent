@@ -12,12 +12,12 @@ import (
 )
 
 type fakeSelfUpdater struct {
-	updateSelf func(semver.Version, string) (*selfupdate.Release, error)
-	updateTo   func(*selfupdate.Release, string) error
+	detectLatest func(string) (*selfupdate.Release, bool, error)
+	updateTo     func(*selfupdate.Release, string) error
 }
 
-func (f *fakeSelfUpdater) UpdateSelf(current semver.Version, slug string) (*selfupdate.Release, error) {
-	return f.updateSelf(current, slug)
+func (f *fakeSelfUpdater) DetectLatest(slug string) (*selfupdate.Release, bool, error) {
+	return f.detectLatest(slug)
 }
 
 func (f *fakeSelfUpdater) UpdateTo(release *selfupdate.Release, cmdPath string) error {
@@ -201,14 +201,17 @@ func TestSnapshotNeedsUpdate(t *testing.T) {
 func TestStableUpdateReturnsRestartRequired(t *testing.T) {
 	current := semver.MustParse("1.2.3")
 	updater := &fakeSelfUpdater{
-		updateSelf: func(gotCurrent semver.Version, gotRepo string) (*selfupdate.Release, error) {
-			if !gotCurrent.Equals(current) {
-				t.Fatalf("UpdateSelf current = %s, want %s", gotCurrent, current)
-			}
+		detectLatest: func(gotRepo string) (*selfupdate.Release, bool, error) {
 			if gotRepo != Repo {
-				t.Fatalf("UpdateSelf repo = %q, want %q", gotRepo, Repo)
+				t.Fatalf("DetectLatest repo = %q, want %q", gotRepo, Repo)
 			}
-			return &selfupdate.Release{Version: semver.MustParse("1.2.4")}, nil
+			return testStableRelease("1.2.4"), true, nil
+		},
+		updateTo: func(release *selfupdate.Release, path string) error {
+			if !release.Version.Equals(semver.MustParse("1.2.4")) || path == "" {
+				t.Fatalf("unexpected update target: %+v, %q", release, path)
+			}
+			return nil
 		},
 	}
 
@@ -223,7 +226,7 @@ func TestSnapshotUpdateReturnsRestartRequired(t *testing.T) {
 	t.Cleanup(func() { CurrentVersion = oldVersion })
 
 	assetName := expectedAssetName(runtime.GOOS, runtime.GOARCH)
-	release := testRelease("Snapshot-2607061200", true, false, time.Now(), assetName)
+	release := testRelease("Snapshot-2607061200", true, false, time.Now(), assetName, assetName+".sha256")
 	updater := &fakeSelfUpdater{
 		updateTo: func(gotRelease *selfupdate.Release, gotPath string) error {
 			if gotRelease.AssetURL != release.Assets[0].BrowserDownloadURL {
@@ -232,12 +235,15 @@ func TestSnapshotUpdateReturnsRestartRequired(t *testing.T) {
 			if gotPath == "" {
 				t.Fatal("UpdateTo received an empty executable path")
 			}
+			if gotRelease.ValidationAssetID != release.Assets[1].ID {
+				t.Fatalf("UpdateTo validation asset = %d, want %d", gotRelease.ValidationAssetID, release.Assets[1].ID)
+			}
 			return nil
 		},
 	}
 	lister := func(owner, repo string) ([]githubRelease, error) {
-		if owner != "komari-monitor" || repo != "komari-agent" {
-			t.Fatalf("list releases repo = %s/%s, want komari-monitor/komari-agent", owner, repo)
+		if owner+"/"+repo != Repo {
+			t.Fatalf("list releases repo = %s/%s, want %s", owner, repo, Repo)
 		}
 		return []githubRelease{release}, nil
 	}
@@ -282,7 +288,7 @@ func testRelease(tag string, prerelease, draft bool, publishedAt time.Time, asse
 			ID:                 int64(i + 1),
 			Name:               name,
 			Size:               1024,
-			BrowserDownloadURL: "https://example.com/" + name,
+			BrowserDownloadURL: "https://github.com/" + Repo + "/releases/download/" + tag + "/" + name,
 		})
 	}
 
@@ -292,8 +298,20 @@ func testRelease(tag string, prerelease, draft bool, publishedAt time.Time, asse
 		Body:        "test release",
 		Draft:       draft,
 		Prerelease:  prerelease,
-		HTMLURL:     "https://example.com/" + tag,
+		HTMLURL:     "https://github.com/" + Repo + "/releases/tag/" + tag,
 		PublishedAt: publishedAt,
 		Assets:      assets,
+	}
+}
+
+func testStableRelease(version string) *selfupdate.Release {
+	parts := strings.Split(Repo, "/")
+	return &selfupdate.Release{
+		Version:           semver.MustParse(version),
+		AssetURL:          "https://github.com/" + Repo + "/releases/download/v" + version + "/" + expectedAssetName(runtime.GOOS, runtime.GOARCH),
+		AssetID:           1,
+		ValidationAssetID: 2,
+		RepoOwner:         parts[0],
+		RepoName:          parts[1],
 	}
 }

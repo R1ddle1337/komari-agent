@@ -1,273 +1,78 @@
-# Workflow Design Notes
+# 自主管理的构建和发布
 
-This directory contains the GitHub Actions workflows for Komari Agent. Keep this
-document updated when changing release, snapshot, or Docker publishing behavior.
+只允许 `R1ddle1337/komari-agent` 的 `owned` 分支发布。本人仓库的 `main` 保留为
+不触发发布的安全副本；原上游只通过独立 `upstream` 远程参考，不把其工作流直接
+同步回本人分支。所有平台、远程终端、任务执行、文件管理和自更新均保留。
 
-The important design split is:
+## 发布流程
 
-- Stable releases use normal GitHub releases and semver tags.
-- Snapshot builds use GitHub prereleases named `Snapshot-yymmddhhMM`.
-- The Docker snapshot image intentionally uses the mutable tag `snapshot`.
-- Stable auto-update must not consume snapshot prereleases.
+- `build.yml`：`owned` 的 push / pull_request 只运行测试和跨平台构建，不发布。
+- `release.yml`：手动运行，输入新的稳定版本，例如 `v1.5.12`。
+- `snapshot.yml`：仅手动运行，生成 `Snapshot-yymmddhhMMSS-runID-attempt`。
+- `publish.yml`：可复用发布实现，验证当前 `owned` commit，先测试，再并行构建，
+  收齐产物、校验后创建草稿 release，最后一次性公开。
+- `release-docker.yml`：仅由完成测试和 release 发布的工作流调用，直接使用同一轮
+  已校验的 Linux 二进制，不另外编译。
+- `generate-release-notes.yml`：手动更新已验证属于 `owned` 历史的 release 说明。
 
-## Workflow Summary
-
-| Workflow | Trigger | Main output | Prerelease handling |
-| --- | --- | --- | --- |
-| `build.yml` | Push to `main` | CI build artifacts for the pushed commit | Not a release workflow |
-| `snapshot.yml` | Push to `main`, manual dispatch | One snapshot prerelease plus `ghcr.io/...:snapshot` | Creates prereleases only |
-| `release.yml` | Published GitHub release | Release binary assets | Skips prereleases |
-| `release-docker.yml` | Published GitHub release, manual dispatch | Stable Docker image tags | Skips prerelease release events |
-| `generate-release-notes.yml` | Published GitHub release, manual dispatch | Generated release notes | Skips prerelease release events |
-
-## Common Build Conventions
-
-Binary names must remain compatible with the updater, installer scripts, and
-Dockerfile:
-
-- Release and snapshot assets are named `komari-agent-${GOOS}-${GOARCH}`.
-- Windows assets append `.exe`.
-- The Dockerfile expects prebuilt Linux binaries named
-  `komari-agent-${TARGETOS}-${TARGETARCH}` in the Docker build context.
-
-The agent version is embedded with:
+可在 Actions 中选择上述稳定或快照工作流，分支选择 `owned`。使用 CLI：
 
 ```sh
--ldflags="-X github.com/komari-monitor/komari-agent/update.CurrentVersion=${VERSION}"
+gh workflow run release.yml --repo R1ddle1337/komari-agent --ref owned -f version=v1.5.12
+gh workflow run snapshot.yml --repo R1ddle1337/komari-agent --ref owned
 ```
 
-Do not remove this without changing the agent update and reporting logic. The
-agent uses `update.CurrentVersion` for update checks and reports it as part of
-basic info.
+运行开始、发布 release 和发布镜像前会核对 `owned` 分支头。期间若出现新提交，
+旧任务拒绝继续发布；应对新的已审查 commit 再运行。已有 tag/release 从不删除、
+覆盖或重用；上传中断可能留下草稿，需要检查后另选新版本。
 
-Prefer `go-version-file: go.mod` for release-producing workflows so Actions uses
-the Go version declared by the project.
+## 版本、产物和更新来源
 
-## `build.yml`
+稳定版只使用普通 SemVer，不把 `+build` 元数据当作升级序号；同分支修订递增 patch。
+快照始终标记 prerelease，不设为 latest。历史快照保留，便于回溯和手动恢复。
 
-Purpose: quick build validation on `main`.
+产物名称保留为 `komari-agent-${GOOS}-${GOARCH}`，Windows 附加 `.exe`。
+每个二进制附带同名 `.sha256` 文件，内容为标准 `sha256sum` 格式：
+64 位十六进制摘要、两个空格、文件名。发布前验证 14 个平台、28 个文件全部到齐。
 
-Trigger:
+每次构建都显式注入：
 
-- Runs on every push to `main`.
-- A single `git push` containing multiple commits creates one workflow run for
-  the pushed ref tip. Multiple separate pushes can create multiple runs.
-
-Jobs:
-
-- Builds a matrix of Windows, Linux, macOS, and FreeBSD targets.
-- Excludes unsupported combinations:
-  - `windows/arm`
-  - `darwin/386`
-  - `darwin/arm`
-- Uploads build artifacts to the workflow run.
-
-This workflow does not publish GitHub releases or Docker images.
-
-## `snapshot.yml`
-
-Purpose: publish the latest development build from `main`.
-
-Trigger:
-
-- Runs on push to `main`.
-- Can be run manually with `workflow_dispatch`.
-
-Race protection:
-
-- Uses concurrency group `snapshot-${{ github.ref }}` with
-  `cancel-in-progress: true`.
-- Validates that the workflow is running for `refs/heads/main`.
-- Validates that `GITHUB_SHA` is still the current `origin/main` commit before
-  building.
-- Re-checks current `origin/main` before publishing the prerelease.
-- Re-checks current `origin/main` before publishing the Docker image.
-
-This means that several separate pushes in a row may start several runs, but the
-latest run is the one intended to publish. If an older run has already published,
-the newer run deletes older snapshot prereleases after it publishes.
-
-Snapshot version format:
-
-```text
-Snapshot-yymmddhhMM
+```sh
+-X github.com/komari-monitor/komari-agent/update.CurrentVersion="$VERSION"
+-X github.com/komari-monitor/komari-agent/update.Repo="$GITHUB_REPOSITORY"
 ```
 
-The timestamp is UTC. The generated value is embedded into the binaries as
-`update.CurrentVersion`.
+原 Go 模块路径保留用于内部包引用，不代表运行时访问上游。
+构建使用固定 Go 1.26.8、`GOTOOLCHAIN=local`、`-mod=readonly` 和 `go mod verify`。
+全部 Actions 固定完整 commit SHA，Docker 基础镜像及 BuildKit 固定 digest。
 
-Binary release job:
+## 测试和权限
 
-- Builds the same OS/architecture matrix as the normal release workflow.
-- Uploads all binaries as workflow artifacts.
-- Creates a GitHub release with `--prerelease`.
-- Uploads all `komari-agent-*` artifacts to that prerelease.
+测试是独立 job，下载依赖并用 `go test -c -o <临时目录>/ ./...` 预编译，随后执行
+`go test -count=1 -timeout 60s ./...`，外层 `timeout 60s` 限制测试执行总时长。
+POSIX 与 PowerShell 安装器另运行离线回归测试，各自限制 60 秒。
+发布 job 必须依赖测试和全部构建成功。测试、构建默认为 `contents: read`；
+仅 release 发布 job 有 `contents: write`，仅镜像发布 job 有 `packages: write`。
+可复用工作流入口声明的写权限只是上限，内部只给相应发布 job。
+不用 `pull_request_target`，checkout 不持久保存凭据，也不启用构建缓存。
 
-Snapshot retention:
+输入通过环境变量传入 shell，先验证版本格式，不将用户输入直接拼进脚本。
+发布机器不存放更新用 GitHub 写权限令牌。
 
-- After creating the current snapshot prerelease, the workflow lists prereleases
-  whose tag starts with `Snapshot-`.
-- It deletes every matching old snapshot release and its tag.
-- The intended release state is exactly one snapshot prerelease: the latest one.
+## Docker
 
-Docker job:
+发布到 `ghcr.io/r1ddle1337/komari-agent`：
 
-- Builds Linux `amd64` and `arm64` binaries for the Docker build context.
-- Builds and pushes a multi-arch image.
-- Publishes only this tag:
+- 稳定版：不可重用的版本 tag，以及可移动 `latest`。
+- 快照版：不可重用的快照版本 tag，以及可移动 `snapshot`。
 
-```text
-ghcr.io/<owner>/<repo>:snapshot
-```
+镜像支持 `linux/amd64`、`linux/arm64`，保留容器标记。基础镜像 marker 阶段
+使用构建机架构，最终阶段只 COPY，不需要运行外部 QEMU/binfmt 安装器。
+容器更新应拉取本人仓库的新镜像；容器内替换二进制不能持久改变镜像。
 
-### Why Docker Uses Only `:snapshot`
+## 信任边界和维护
 
-The mutable `snapshot` Docker tag is intentional.
-
-Users who run prerelease containers usually want to follow the newest snapshot.
-A stable tag reference such as `ghcr.io/...:snapshot` lets Docker image updaters
-pull the same tag and detect that the image digest changed.
-
-Adding immutable timestamp tags like `Snapshot-yymmddhhMM` can be useful for
-traceability, but users pinned to such a timestamp tag will not automatically
-move to the next snapshot. If timestamp image tags are added later, keep
-`:snapshot` as the moving tag.
-
-### Snapshot Docker Updates
-
-Container-based updates and binary self-updates are different mechanisms:
-
-- Watchtower-style tools update containers by comparing the image behind the
-  configured tag. They should work with the mutable `:snapshot` tag because each
-  new snapshot push changes the image digest.
-- The agent's own self-update logic updates the binary inside the running
-  container filesystem. That does not update the Docker image. If the container
-  is recreated, the image contents win again.
-- The Dockerfile creates `/.komari-agent-container`. Snapshot-aware auto-update
-  uses that marker to skip binary self-update in containers and leave updates to
-  image refresh tooling.
-
-For Docker prerelease users, prefer `:snapshot` plus a container image updater.
-For non-container prerelease users, snapshot-aware binary self-update follows
-the latest `Snapshot-*` GitHub prerelease.
-
-## `release.yml`
-
-Purpose: attach stable release binaries to a published GitHub release.
-
-Trigger:
-
-- Runs when a GitHub release is published.
-
-Prerelease guard:
-
-```yaml
-if: ${{ !github.event.release.prerelease }}
-```
-
-This guard is important. Snapshot releases are GitHub prereleases, and this
-workflow must not attach stable-release assets or perform stable-release behavior
-for a snapshot.
-
-Jobs:
-
-- Builds Windows, Linux, macOS, and FreeBSD binaries.
-- Embeds the release tag as `update.CurrentVersion`.
-- Uploads the matching binary to the GitHub release.
-
-## `release-docker.yml`
-
-Purpose: publish stable Docker images.
-
-Trigger:
-
-- Runs when a GitHub release is published.
-- Can be run manually with `workflow_dispatch`.
-
-Prerelease guard:
-
-```yaml
-if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
-```
-
-This means prerelease release events do not publish stable Docker tags. Manual
-runs are still allowed.
-
-Jobs:
-
-- Builds Linux `amd64` and `arm64` binaries for the Docker build context.
-- Builds and pushes a multi-arch image.
-- On release events, publishes:
-  - the release tag, such as `v1.2.3`
-  - `latest`
-
-Do not let snapshot prereleases publish `latest`.
-
-## `generate-release-notes.yml`
-
-Purpose: generate and apply GitHub release notes.
-
-Trigger:
-
-- Runs when a GitHub release is published.
-- Can be run manually for a specific tag.
-
-Prerelease guard:
-
-```yaml
-if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
-```
-
-Snapshot prereleases intentionally keep their simple automated snapshot notes and
-do not trigger normal stable-release note generation.
-
-## Auto-Update Interaction
-
-Stable auto-update behavior:
-
-- The agent calls `update.CheckAndUpdate()` when auto-update is enabled.
-- `CheckAndUpdate()` uses `github.com/rhysd/go-github-selfupdate/selfupdate`.
-- That library's normal latest-release detection skips GitHub prereleases.
-- Therefore stable agents with auto-update enabled should not update to
-  `Snapshot-*` prereleases.
-
-Snapshot auto-update behavior:
-
-- Snapshot builds are identified by the embedded `update.CurrentVersion` prefix
-  `Snapshot-`.
-- Snapshot agents list GitHub releases and select the newest non-draft
-  prerelease whose tag starts with `Snapshot-` and contains the exact platform
-  asset name.
-- Snapshot agents update only to another snapshot prerelease.
-- Snapshot agents running in Docker skip binary self-update when
-  `/.komari-agent-container` exists.
-
-The Docker image tag is not used as the binary version source. The Docker tag is
-always `snapshot` by design. Snapshot binary update decisions use the embedded
-binary version `update.CurrentVersion == Snapshot-yymmddhhMM` and GitHub release
-metadata instead.
-
-Container guidance for future update changes:
-
-- A binary running in Docker can potentially replace `/app/komari-agent`, but
-  that only changes the container's writable layer.
-- After self-update, the current code exits with status `42`; the container needs
-  a restart policy or external supervisor to come back.
-- Recreating the container from the image discards any in-container binary
-  replacement.
-- Prefer image-level updates for Docker deployments.
-
-## Change Checklist
-
-Before changing these workflows, check:
-
-- Snapshot releases are still created with `--prerelease`.
-- Stable release workflows still skip prereleases.
-- Snapshot cleanup still deletes old `Snapshot-*` prereleases after the new one
-  is created.
-- Docker snapshot publishing still keeps the mutable `snapshot` tag.
-- Stable Docker publishing does not run for snapshot prereleases and does not
-  publish `latest` for snapshots.
-- Binary asset names still match updater, installer, and Dockerfile expectations.
-- `update.CurrentVersion` is still embedded in all release-producing binaries.
-- Race protection still prevents stale `main` commits from publishing snapshots.
+人工审查后才合并上游修改，再由本人触发发布；不要添加自动拉取上游并发布的任务。
+SHA-256 防止下载损坏和不一致，不是独立数字签名，不能抵抗本人 GitHub 发布账号
+或具有写权限的构建任务同时被攻破。仓库权限、账号 MFA、依赖及固定 Actions 更新
+仍需维护。上述改动不是对整个 Agent 的完整安全审计。
