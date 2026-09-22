@@ -84,6 +84,7 @@ release_repository="R1ddle1337/komari-agent"
 version_to_install="v1.0.0-owned.1"
 download_url="https://github.com/$release_repository/releases/download/$version_to_install/$file_name"
 service_user=root
+if [ -z "${EUID:-}" ]; then EUID=$(id -u); fi
 GREEN="" CYAN="" NC=""
 for mock_mode in missing mismatch valid; do
     printf 'existing release\n' > "$komari_agent_path"
