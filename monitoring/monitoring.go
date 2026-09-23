@@ -74,17 +74,15 @@ func GenerateReport() []byte {
 	message := ""
 	data := report{}
 
-	cpu := unit.Cpu()
-	cpuUsage := cpu.CPUUsage
+	cpuUsage := unit.CPUUsage()
 	if cpuUsage <= 0.001 {
 		cpuUsage = 0.001
 	}
 	data.CPU = cpuReport{Usage: cpuUsage}
 
-	ram := unit.Ram()
+	ram, swap := unit.MemoryAndSwap()
 	data.Ram = usageReport{Total: ram.Total, Used: ram.Used}
 
-	swap := unit.Swap()
 	data.Swap = usageReport{Total: swap.Total, Used: swap.Used}
 	load := unit.Load()
 	data.Load = loadReport{Load1: load.Load1, Load5: load.Load5, Load15: load.Load15}

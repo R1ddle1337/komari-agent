@@ -22,13 +22,18 @@ type CpuInfo struct {
 
 func Cpu() CpuInfo {
 	cpuinfo := CpuStaticInfo()
+	cpuinfo.CPUUsage = CPUUsage()
+	return cpuinfo
+}
 
+// CPUUsage samples utilization without rereading static CPU topology. Static
+// information is collected separately by the basic-info uploader.
+func CPUUsage() float64 {
 	percentages, err := cpu.Percent(0, false)
 	if err == nil && len(percentages) > 0 {
-		cpuinfo.CPUUsage = percentages[0]
+		return percentages[0]
 	}
-
-	return cpuinfo
+	return 0
 }
 
 func CpuStaticInfo() CpuInfo {

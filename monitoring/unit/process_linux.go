@@ -4,8 +4,8 @@
 package monitoring
 
 import (
+	"io"
 	"os"
-	"strconv"
 )
 
 // ProcessCount returns the number of running processes
@@ -23,17 +23,37 @@ func processCountLinux() (count int) {
 		}
 	}
 
-	entries, err := os.ReadDir(procDir)
+	dir, err := os.Open(procDir)
 	if err != nil {
 		return 0
 	}
-
-	for _, entry := range entries {
-		if _, err := strconv.ParseInt(entry.Name(), 10, 64); err == nil {
-			//if _, err := filepath.ParseInt(entry.Name(), 10, 64); err == nil {
-			count++
+	defer dir.Close()
+	// Only names are needed. Read in bounded chunks without DirEntry creation,
+	// metadata reads, integer parsing errors, or sorting every process.
+	for {
+		names, err := dir.Readdirnames(256)
+		for _, name := range names {
+			if isProcessID(name) {
+				count++
+			}
+		}
+		if err == io.EOF {
+			return count
+		}
+		if err != nil {
+			return 0
 		}
 	}
+}
 
-	return count
+func isProcessID(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := range name {
+		if name[i] < '0' || name[i] > '9' {
+			return false
+		}
+	}
+	return true
 }

@@ -94,29 +94,41 @@ func GetMemHtopLike() RamInfo {
 	if runtime.GOOS == "linux" {
 		info, err := ReadProcMeminfo()
 		if err == nil && info.MemTotal > 0 {
-			raminfo.Total = info.MemTotal
-			// htop logic:
-			// usedDiff = free + cached + sreclaimable + buffers
-			usedDiff := info.MemFree + info.Cached + info.SReclaimable + info.Buffers
-
-			if info.MemTotal >= usedDiff {
-				raminfo.Used = info.MemTotal - usedDiff
-			} else {
-				raminfo.Used = info.MemTotal - info.MemFree
-			}
-			raminfo.Used += info.Shmem
-
-			//if info.Zswap > 0 || info.Zswapped > 0 {
-			//	if raminfo.Used > info.Zswap {
-			//		raminfo.Used -= info.Zswap
-			//	} else {
-			//		raminfo.Used = 0
-			//	}
-			//}
-			return raminfo
+			return ramFromProc(info, false)
 		}
 	}
 	return raminfo
+}
+
+func ramFromProc(info *ProcMemInfo, includeCache bool) RamInfo {
+	if includeCache {
+		return RamInfo{Total: info.MemTotal, Used: info.MemTotal - info.MemFree, Mode: "includeCache"}
+	}
+	usedDiff := info.MemFree + info.Cached + info.SReclaimable + info.Buffers
+	used := info.MemTotal - info.MemFree
+	if info.MemTotal >= usedDiff {
+		used = info.MemTotal - usedDiff
+	}
+	return RamInfo{Total: info.MemTotal, Used: used + info.Shmem, Mode: "htoplike"}
+}
+
+func swapFromProc(info *ProcMemInfo) RamInfo {
+	used := info.SwapTotal - info.SwapFree
+	if deductions := info.SwapFree + info.SwapCached; info.SwapTotal >= deductions {
+		used = info.SwapTotal - deductions
+	}
+	return RamInfo{Total: info.SwapTotal, Used: used}
+}
+
+// MemoryAndSwap reads one coherent Linux snapshot per report, retaining the
+// configured memory accounting and the platform fallbacks used by Ram/Swap.
+func MemoryAndSwap() (RamInfo, RamInfo) {
+	if runtime.GOOS == "linux" {
+		if info, err := ReadProcMeminfo(); err == nil && info.MemTotal > 0 {
+			return ramFromProc(info, pkg_flags.GlobalConfig.MemoryIncludeCache), swapFromProc(info)
+		}
+	}
+	return Ram(), Swap()
 }
 
 func GetMemGopsutil() RamInfo {
@@ -216,16 +228,7 @@ func Swap() RamInfo {
 	if runtime.GOOS == "linux" {
 		info, err := ReadProcMeminfo()
 		if err == nil {
-			swapinfo.Total = info.SwapTotal
-			// used = total - free - cached
-			// Check for underflow
-			usedDeductions := info.SwapFree + info.SwapCached
-			if info.SwapTotal >= usedDeductions {
-				swapinfo.Used = info.SwapTotal - usedDeductions
-			} else {
-				swapinfo.Used = info.SwapTotal - info.SwapFree
-			}
-			return swapinfo
+			return swapFromProc(info)
 		}
 	}
 
