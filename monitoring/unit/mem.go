@@ -123,6 +123,12 @@ func swapFromProc(info *ProcMemInfo) RamInfo {
 // MemoryAndSwap reads one coherent Linux snapshot per report, retaining the
 // configured memory accounting and the platform fallbacks used by Ram/Swap.
 func MemoryAndSwap() (RamInfo, RamInfo) {
+	// In include-cache mode gopsutil honors HOST_PROC, whereas the existing
+	// Swap reader uses this process's /proc. Preserve that configured behavior
+	// instead of silently changing the memory source inside containers.
+	if pkg_flags.GlobalConfig.MemoryIncludeCache && os.Getenv("HOST_PROC") != "" {
+		return Ram(), Swap()
+	}
 	if runtime.GOOS == "linux" {
 		if info, err := ReadProcMeminfo(); err == nil && info.MemTotal > 0 {
 			return ramFromProc(info, pkg_flags.GlobalConfig.MemoryIncludeCache), swapFromProc(info)

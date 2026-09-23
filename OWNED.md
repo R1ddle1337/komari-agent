@@ -111,3 +111,9 @@ MIT 许可证及上游版权声明保持不变。
 
 新增完整报告 BenchmarkGenerateReport；同机基准每次分配从约 524 KB 降至 273 KB，
 约 4090 次分配降至 1900 次。内存记账边界、分块进程计数及采样竞争检测通过。
+
+## 1.5.18 容器内存来源兼容
+
+`HOST_PROC` 与 `--memory-include-cache` 同时使用时，保留原 gopsutil 的宿主机内存读取路径，
+避免合并 meminfo 读取改变统计来源。该组合沿用原 RAM/Swap 读取；其余采样性能优化保持生效。
+新增隔离 HOST_PROC 固定 meminfo 回归测试，检查总内存、已用内存和报告模式，monitoring race 及全量测试通过。

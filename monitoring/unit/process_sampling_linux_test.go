@@ -26,3 +26,18 @@ func TestProcessCountChunks(t *testing.T) {
 		t.Fatalf("process count = %d", got)
 	}
 }
+
+func TestMemorySamplingPreservesHostProcIncludeCache(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "meminfo"), []byte("MemTotal: 65536 kB\nMemFree: 16384 kB\nMemAvailable: 32768 kB\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOST_PROC", root)
+	previous := flags.MemoryIncludeCache
+	flags.MemoryIncludeCache = true
+	defer func() { flags.MemoryIncludeCache = previous }()
+	ram, _ := MemoryAndSwap()
+	if ram.Total != 65536*1024 || ram.Used != (65536-16384)*1024 || ram.Mode != "includeCache" {
+		t.Fatalf("HOST_PROC memory source changed: %+v", ram)
+	}
+}
