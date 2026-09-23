@@ -39,7 +39,7 @@ func EstablishWebSocketConnection() {
 		if conn != nil {
 			conn.Close()
 		}
-		setConnectionProtocolVersion(2)
+
 	}()
 	var err error
 	interval := math.Max(1, flags.Interval)
@@ -54,7 +54,6 @@ func EstablishWebSocketConnection() {
 	heartbeatTicker := time.NewTicker(30 * time.Second)
 	defer heartbeatTicker.Stop()
 
-	activeProtocol := uploadProtocolVersion()
 	var readDone <-chan struct{}
 
 	for {
@@ -67,12 +66,12 @@ func EstablishWebSocketConnection() {
 					if retry > 0 {
 						log.Println("Retrying websocket connection, attempt:", retry)
 					}
-					conn, activeProtocol, err = connectNegotiatedWebSocket(activeProtocol)
+					conn, err = connectWebSocket(buildWebSocketEndpoint())
 					if err == nil {
-						log.Printf("WebSocket connected using v%d protocol", activeProtocol)
+						log.Println("v2 WebSocket connected")
 						done := make(chan struct{})
 						readDone = done
-						go handleWebSocketMessages(conn, activeProtocol, done)
+						go handleWebSocketMessages(conn, done)
 						break
 					} else {
 						log.Println("Failed to connect to WebSocket:", err)
@@ -83,23 +82,16 @@ func EstablishWebSocketConnection() {
 
 				if retry > flags.MaxRetries {
 					log.Println("Max retries reached.")
-					if activeProtocol == 1 {
-						return
-					}
-					conn, err = runPostFallback(buildWebSocketEndpoint(2), interval)
+					conn, err = runPostFallback(buildWebSocketEndpoint(), interval)
 					if err != nil {
-						if shouldFallbackToV1(err) {
-							activeProtocol = 1
-							continue
-						}
 						log.Println("POST fallback stopped:", err)
 						return
 					}
 					log.Println("WebSocket recovered from POST fallback")
-					setConnectionProtocolVersion(2)
+
 					done := make(chan struct{})
 					readDone = done
-					go handleWebSocketMessages(conn, 2, done)
+					go handleWebSocketMessages(conn, done)
 				}
 			}
 			if conn == nil || time.Now().Before(nextReportAt) {
@@ -107,15 +99,14 @@ func EstablishWebSocketConnection() {
 			}
 			nextReportAt = time.Now().Add(reportInterval)
 
-			data := buildReportPayload(activeProtocol, monitoring.GenerateReport())
+			data := v2.BuildReportPayload(monitoring.GenerateReport())
 			err = conn.WriteMessage(websocket.TextMessage, data)
 			if err != nil {
 				log.Println("Failed to send WebSocket message:", err)
 				conn.Close()
 				conn = nil // Mark connection as dead
 				readDone = nil
-				activeProtocol = 2
-				setConnectionProtocolVersion(2)
+
 				continue
 			}
 		case <-heartbeatTicker.C:
@@ -126,8 +117,7 @@ func EstablishWebSocketConnection() {
 					conn.Close()
 					conn = nil // Mark connection as dead
 					readDone = nil
-					activeProtocol = 2
-					setConnectionProtocolVersion(2)
+
 				}
 			}
 		case <-readDone:
@@ -137,24 +127,13 @@ func EstablishWebSocketConnection() {
 				conn = nil
 			}
 			readDone = nil
-			activeProtocol = 2
-			setConnectionProtocolVersion(2)
+
 		}
 	}
 }
 
-func buildReportPayload(protocolVersion int, report []byte) []byte {
-	if protocolVersion >= 2 {
-		return v2.BuildReportPayload(report)
-	}
-	return report
-}
-
-func buildWebSocketEndpoint(protocolVersion int) string {
-	path := "/api/clients/report?token="
-	if protocolVersion >= 2 {
-		path = "/api/clients/v2/rpc?token="
-	}
+func buildWebSocketEndpoint() string {
+	path := "/api/clients/v2/rpc?token="
 	websocketEndpoint := strings.TrimSuffix(flags.Endpoint, "/") + path + flags.Token
 	websocketEndpoint = "ws" + strings.TrimPrefix(websocketEndpoint, "http")
 	if convertedEndpoint, err := utils.ConvertIDNToASCII(websocketEndpoint); err == nil {
@@ -163,24 +142,6 @@ func buildWebSocketEndpoint(protocolVersion int) string {
 		log.Printf("Warning: Failed to convert WebSocket IDN to ASCII: %v", err)
 	}
 	return websocketEndpoint
-}
-
-func connectNegotiatedWebSocket(preferred int) (*ws.SafeConn, int, error) {
-	conn, err := connectWebSocket(buildWebSocketEndpoint(preferred))
-	if preferred == 2 && shouldFallbackToV1(err) {
-		log.Println("Panel v2 WebSocket endpoint is unavailable; trying v1 protocol")
-		legacyConn, legacyErr := connectWebSocket(buildWebSocketEndpoint(1))
-		if legacyErr == nil {
-			setConnectionProtocolVersion(1)
-			return legacyConn, 1, nil
-		}
-		// 两种 WS 都不可用时仍允许原有 v2 POST 模式，不能因试探 v1 丢失该能力。
-		return nil, 2, fmt.Errorf("v2 WebSocket failed: %v; v1 negotiation failed: %w", err, legacyErr)
-	}
-	if err == nil {
-		setConnectionProtocolVersion(preferred)
-	}
-	return conn, preferred, err
 }
 
 func runPostFallback(websocketEndpoint string, interval float64) (*ws.SafeConn, error) {
@@ -201,9 +162,6 @@ func runPostFallback(websocketEndpoint string, interval float64) (*ws.SafeConn, 
 			ackIDs := snapshotV2AckEventIDs()
 			resp, err := postV2Request(v2.BuildReportRequest(reportID, monitoring.GenerateReport(), ackIDs))
 			if err != nil {
-				if shouldFallbackToV1(err) {
-					return nil, err
-				}
 				log.Println("Failed to POST v2 report:", err)
 				continue
 			}
@@ -392,17 +350,13 @@ func connectWebSocket(websocketEndpoint string) (*ws.SafeConn, error) {
 	return ws.NewSafeConn(conn), nil
 }
 
-func handleWebSocketMessages(conn *ws.SafeConn, protocolVersion int, done chan<- struct{}) {
+func handleWebSocketMessages(conn *ws.SafeConn, done chan<- struct{}) {
 	defer close(done)
 	for {
 		_, message_raw, err := conn.ReadMessage()
 		if err != nil {
 			log.Println("WebSocket read error:", err)
 			return
-		}
-		if protocolVersion == 1 {
-			handleV1Message(conn, message_raw)
-			continue
 		}
 		var message v2.Request
 		err = json.Unmarshal(message_raw, &message)
@@ -429,7 +383,7 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 			Command string `json:"command"`
 		}
 		if err := v2.BindParams(params, &p); err == nil {
-			go NewTask(2, p.TaskID, p.Command)
+			go NewTask(p.TaskID, p.Command)
 			return true
 		} else {
 			log.Printf("bad v2 exec params: %v", err)
@@ -441,7 +395,7 @@ func processV2Event(conn *ws.SafeConn, method string, params interface{}, eventI
 			Target string `json:"ping_target"`
 		}
 		if err := v2.BindParams(params, &p); err == nil {
-			go NewPingTask(conn, 2, p.TaskID, p.Type, p.Target)
+			go NewPingTask(conn, p.TaskID, p.Type, p.Target)
 			return true
 		} else {
 			log.Printf("bad v2 ping params: %v", err)

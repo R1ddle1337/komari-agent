@@ -15,27 +15,26 @@ import (
 	"strings"
 	"time"
 
-	"github.com/komari-monitor/komari-agent/dnsresolver"
 	v2 "github.com/komari-monitor/komari-agent/protocol/v2"
 	"github.com/komari-monitor/komari-agent/ws"
 	ping "github.com/prometheus-community/pro-bing"
 )
 
-func NewTask(protocolVersion int, task_id, command string) {
+func NewTask(task_id, command string) {
 	if task_id == "" {
 		return
 	}
 	if strings.TrimSpace(command) == "" {
-		uploadTaskResult(protocolVersion, task_id, "No command provided", 0, time.Now())
+		uploadTaskResult(task_id, "No command provided", 0, time.Now())
 		return
 	}
 	if flags.DisableWebSsh {
-		uploadTaskResult(protocolVersion, task_id, "Remote control is disabled.", -1, time.Now())
+		uploadTaskResult(task_id, "Remote control is disabled.", -1, time.Now())
 		return
 	}
 	log.Printf("Executing task %s (%d command bytes)", task_id, len(command))
 	result, exitCode := runTaskCommand(command)
-	uploadTaskResult(protocolVersion, task_id, result, exitCode, time.Now())
+	uploadTaskResult(task_id, result, exitCode, time.Now())
 }
 
 func runTaskCommand(command string) (string, int) {
@@ -110,28 +109,20 @@ func appendErrorResult(result, err string) string {
 	return result + "\n" + err
 }
 
-func uploadTaskResult(protocolVersion int, taskID, result string, exitCode int, finishedAt time.Time) {
-	if err := sendTaskResult(protocolVersion, taskID, result, exitCode, finishedAt); err != nil {
+func uploadTaskResult(taskID, result string, exitCode int, finishedAt time.Time) {
+	if err := sendTaskResult(taskID, result, exitCode, finishedAt); err != nil {
 		log.Printf("Failed to upload task result: %v", err)
 	}
 }
 
-func sendTaskResult(protocolVersion int, taskID, result string, exitCode int, finishedAt time.Time) error {
+func sendTaskResult(taskID, result string, exitCode int, finishedAt time.Time) error {
 	params := v2.TaskResultParams{TaskID: taskID, Result: result, ExitCode: exitCode, FinishedAt: finishedAt}
-	if protocolVersion == 1 {
-		return postV1JSON("/api/clients/task/result", params)
-	}
 	payload := v2.Request{
 		JSONRPC: v2.Version,
 		Method:  v2.MethodAgentTaskResult,
 		Params:  params,
 	}
-	err := postV2RPC(payload)
-	if shouldFallbackToV1(err) {
-		// 1.4.x 面板支持 v2 上报，但命令结果仍使用旧 REST 接口；不降级整条连接。
-		return postV1JSON("/api/clients/task/result", params)
-	}
-	return err
+	return postV2RPC(payload)
 }
 
 // resolveIP 解析域名到 IP 地址，排除 DNS 查询时间
@@ -254,7 +245,7 @@ func httpPing(target string, timeout time.Duration) (int64, error) {
 	return latency, errors.New("http status not ok")
 }
 
-func NewPingTask(conn *ws.SafeConn, protocolVersion int, taskID uint, pingType, pingTarget string) {
+func NewPingTask(conn *ws.SafeConn, taskID uint, pingType, pingTarget string) {
 	if taskID == 0 {
 		log.Printf("Invalid task ID: %d", taskID)
 		return
@@ -313,28 +304,17 @@ func NewPingTask(conn *ws.SafeConn, protocolVersion int, taskID uint, pingType, 
 		pingResult = int(latency)
 	}
 	finishedAt := time.Now()
-	if err := sendPingResult(conn, protocolVersion, taskID, pingType, pingResult, finishedAt); err != nil {
+	if err := sendPingResult(conn, taskID, pingType, pingResult, finishedAt); err != nil {
 		log.Printf("Failed to upload ping result: %v", err)
 	}
 }
 
-func sendPingResult(conn *ws.SafeConn, protocolVersion int, taskID uint, pingType string, result int, finishedAt time.Time) error {
-	var wsPayload interface{} = v2.BuildPingResultPayload(taskID, pingType, result, finishedAt)
-	if protocolVersion == 1 {
-		wsPayload = map[string]interface{}{"type": "ping_result", "task_id": taskID, "ping_type": pingType, "value": result, "finished_at": finishedAt}
-	}
-	// https://github.com/komari-monitor/komari/commit/eb87a4fc330b7d1c407fa4ff70177615a4f50a1f
-	// -1 代表丢包，服务端计算
-	//if pingResult == -1 {
-	//	return
-	//}
+func sendPingResult(conn *ws.SafeConn, taskID uint, pingType string, result int, finishedAt time.Time) error {
+	payload := v2.BuildPingResultPayload(taskID, pingType, result, finishedAt)
 	if conn == nil {
-		if protocolVersion == 1 {
-			return postV1JSON("/api/clients/ping/result", wsPayload)
-		}
-		return postV2RPC(wsPayload)
+		return postV2RPC(payload)
 	}
-	return conn.WriteJSON(wsPayload)
+	return conn.WriteJSON(payload)
 }
 
 func postV2RPC(payload interface{}) error {
@@ -342,41 +322,8 @@ func postV2RPC(payload interface{}) error {
 	if err != nil {
 		return err
 	}
-	endpoint := strings.TrimSuffix(flags.Endpoint, "/") + "/api/clients/v2/rpc?token=" + flags.Token
-	compressed := false
-	if !flags.DisableCompression {
-		if gz, err := gzipBytes(body); err == nil {
-			body = gz
-			compressed = true
-		}
-	}
-	req, err := http.NewRequest("POST", endpoint, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if compressed {
-		req.Header.Set("Content-Encoding", "gzip")
-	}
-	client := dnsresolver.GetHTTPClientWithPreference(30*time.Second, flags.PreferIPVersion)
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	respBody, err := readControlResponse(resp.Body)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return &httpStatusError{StatusCode: resp.StatusCode, Status: resp.Status, Body: string(respBody)}
-	}
-	if len(bytes.TrimSpace(respBody)) > 0 {
-		if _, err := parseV2Response(respBody); err != nil {
-			return err
-		}
-	}
-	return nil
+	_, err = postV2Request(body)
+	return err
 }
 
 func gzipBytes(data []byte) ([]byte, error) {

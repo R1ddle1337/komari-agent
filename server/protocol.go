@@ -2,25 +2,10 @@ package server
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"net/http"
-	"sync/atomic"
 
 	v2 "github.com/komari-monitor/komari-agent/protocol/v2"
 )
-
-var connectionProtocol atomic.Int32
-
-// 每个 Agent 进程只连接一个面板；后台基础信息上报与连接协商共享当前协议。
-func uploadProtocolVersion() int {
-	if connectionProtocol.Load() == 1 {
-		return 1
-	}
-	return 2
-}
-
-func setConnectionProtocolVersion(version int) { connectionProtocol.Store(int32(version)) }
 
 type v2ResponseError struct {
 	Code    int
@@ -35,29 +20,6 @@ type v2FormatError struct{ err error }
 
 func (e *v2FormatError) Error() string { return e.err.Error() }
 func (e *v2FormatError) Unwrap() error { return e.err }
-
-// 仅确定的协议不兼容触发回退；鉴权失败、TLS/网络故障或服务端临时故障不降级。
-func shouldFallbackToV1(err error) bool {
-	var status *httpStatusError
-	if errors.As(err, &status) {
-		switch status.StatusCode {
-		case http.StatusOK, http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
-			return true
-		case http.StatusBadRequest:
-			// 1.4.x 主控将 JSON-RPC method-not-found 映射为 HTTP 400。
-			// 仅认可完整 v2 错误信封，不能把参数错误或鉴权失败当成协议缺失。
-			var response v2.Response
-			return json.Unmarshal([]byte(status.Body), &response) == nil &&
-				response.JSONRPC == v2.Version && response.Error != nil && response.Error.Code == -32601
-		}
-	}
-	var format *v2FormatError
-	if errors.As(err, &format) {
-		return true
-	}
-	var rpc *v2ResponseError
-	return errors.As(err, &rpc) && rpc.Code == -32601
-}
 
 type httpStatusError struct {
 	StatusCode int
