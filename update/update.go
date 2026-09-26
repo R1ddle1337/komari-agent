@@ -19,6 +19,7 @@ import (
 	"github.com/blang/semver"
 	"github.com/komari-monitor/komari-agent/dnsresolver"
 	"github.com/komari-monitor/komari-agent/internal/selfupdate"
+	"github.com/komari-monitor/komari-agent/utils"
 )
 
 var ErrRestartRequired = errors.New("update installed; restart required")
@@ -258,7 +259,7 @@ func updaterConfig() selfupdate.Config {
 	return selfupdate.Config{
 		Validator:  &checksumValidator{},
 		AssetName:  expectedAssetName(runtime.GOOS, runtime.GOARCH),
-		HTTPClient: dnsresolver.GetHTTPClient(60 * time.Second),
+		HTTPClient: dnsresolver.GetVerifiedHTTPClient(60 * time.Second),
 		APIToken:   os.Getenv("GITHUB_TOKEN"),
 	}
 }
@@ -285,9 +286,9 @@ func listGitHubReleases(owner, repo string) ([]githubRelease, error) {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}
 
-		resp, err := dnsresolver.GetHTTPClient(60 * time.Second).Do(req)
+		resp, err := dnsresolver.GetVerifiedHTTPClient(60 * time.Second).Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("failed to list GitHub releases: %w", err)
+			return nil, fmt.Errorf("failed to list GitHub releases: %w", utils.SanitizeHTTPError(err))
 		}
 
 		if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {

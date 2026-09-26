@@ -16,12 +16,15 @@ import (
 
 	pkg_flags "github.com/komari-monitor/komari-agent/cmd/flags"
 	"github.com/komari-monitor/komari-agent/dnsresolver"
+	"github.com/komari-monitor/komari-agent/utils"
 )
 
 const (
 	fileStreamHTTPTimeout    = 30 * time.Minute
 	fileStreamBufferSize     = 512 * 1024
 	maxFileStreamOperations  = 8
+	maxUploadSessions        = 64
+	uploadSessionIdleTimeout = time.Hour
 	uploadCancelTombstoneTTL = 15 * time.Minute
 )
 
@@ -120,7 +123,7 @@ func sendDownloadStream(args map[string]interface{}) (json.RawMessage, error) {
 	defer releaseFileStreamSlot()
 	request, err := http.NewRequestWithContext(streamContext, http.MethodPost, transferURL, io.NewSectionReader(file, offset, length))
 	if err != nil {
-		return nil, fmt.Errorf("download_stream: create HTTP request: %w", err)
+		return nil, fmt.Errorf("download_stream: create HTTP request: %w", utils.SanitizeHTTPError(err))
 	}
 	request.ContentLength = length
 	request.Header.Set("Content-Type", "application/octet-stream")
@@ -136,7 +139,7 @@ func sendDownloadStream(args map[string]interface{}) (json.RawMessage, error) {
 
 	response, err := fileStreamHTTPClient().Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("download_stream: HTTP request: %w", err)
+		return nil, fmt.Errorf("download_stream: HTTP request: %w", utils.SanitizeHTTPError(err))
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -174,7 +177,7 @@ func receiveUploadStream(args map[string]interface{}) (json.RawMessage, error) {
 	defer releaseFileStreamSlot()
 	request, err := http.NewRequestWithContext(streamContext, http.MethodPost, transferURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("upload_stream: HTTP request: %w", err)
+		return nil, fmt.Errorf("upload_stream: HTTP request: %w", utils.SanitizeHTTPError(err))
 	}
 	request.ContentLength = 0
 	request.Header.Set("Accept", "application/octet-stream")
@@ -185,7 +188,7 @@ func receiveUploadStream(args map[string]interface{}) (json.RawMessage, error) {
 	request.Header.Set("X-Komari-Transfer-Length", fmt.Sprintf("%d", spec.Expected))
 	response, err := fileStreamHTTPClient().Do(request)
 	if err != nil {
-		return nil, fmt.Errorf("upload_stream: HTTP request: %w", err)
+		return nil, fmt.Errorf("upload_stream: HTTP request: %w", utils.SanitizeHTTPError(err))
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
@@ -395,24 +398,34 @@ func writeUploadStreamChunk(spec uploadStreamSpec, source io.Reader) (json.RawMe
 	state, exists := uploadChunks[spec.UploadID]
 	if spec.First {
 		if !exists {
+			pruneUploadSessionsLocked(time.Now())
+			if len(uploadChunks) >= maxUploadSessions {
+				uploadChunksMu.Unlock()
+				return nil, errors.New("too many unfinished uploads; finish or cancel an existing upload")
+			}
 			state = uploadChunkState{
 				ExpectedSize: spec.TotalSize,
 				ChunkSize:    spec.ChunkSize,
 				TargetPath:   spec.Path,
 				PartCount:    spec.ChunkCount,
 				Parts:        make(map[int64]struct{}),
+				CreatedAt:    time.Now(),
 			}
-			partPath := uploadPartPathFor(spec.Path, spec.UploadID)
-			file, openErr := os.OpenFile(partPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+			file, openErr := os.CreateTemp(filepath.Dir(spec.Path), "."+filepath.Base(spec.Path)+".komari-upload-*.part")
 			if openErr != nil {
 				uploadChunksMu.Unlock()
 				return nil, openErr
 			}
-			if closeErr := file.Close(); closeErr != nil {
+			info, statErr := file.Stat()
+			if statErr != nil {
+				_ = file.Close()
+				_ = os.Remove(file.Name())
 				uploadChunksMu.Unlock()
-				return nil, closeErr
+				return nil, statErr
 			}
-			state.TempPath = partPath
+			state.TempPath = file.Name()
+			state.File = file
+			state.FileInfo = info
 			uploadChunks[spec.UploadID] = state
 			exists = true
 		}
@@ -436,14 +449,23 @@ func writeUploadStreamChunk(spec uploadStreamSpec, source io.Reader) (json.RawMe
 		uploadChunksMu.Unlock()
 		return nil, errors.New("upload chunk count does not match session")
 	}
-	partPath := state.TempPath
-	if partPath == "" {
-		partPath = uploadPartPathFor(spec.Path, spec.UploadID)
-	}
+	state.ActiveWrites++
+	state.CreatedAt = time.Now()
+	uploadChunks[spec.UploadID] = state
 	uploadChunksMu.Unlock()
+	file := state.File
+	defer func() {
+		uploadChunksMu.Lock()
+		defer uploadChunksMu.Unlock()
+		current, ok := uploadChunks[spec.UploadID]
+		if ok && current.File == file {
+			current.ActiveWrites--
+			current.CreatedAt = time.Now()
+			uploadChunks[spec.UploadID] = current
+		}
+	}()
 
-	file, err := os.OpenFile(partPath, os.O_WRONLY|os.O_CREATE, 0o600)
-	if err != nil {
+	if err := verifyUploadPart(state); err != nil {
 		return nil, err
 	}
 	buffer := fileStreamBufferPool.Get().([]byte)
@@ -451,18 +473,12 @@ func writeUploadStreamChunk(spec uploadStreamSpec, source io.Reader) (json.RawMe
 	written, copyErr := io.CopyBuffer(writer, io.LimitReader(source, spec.Expected), buffer)
 	fileStreamBufferPool.Put(buffer)
 	if copyErr != nil {
-		_ = file.Close()
 		return nil, copyErr
 	}
 	if written != spec.Expected {
-		_ = file.Close()
 		return nil, fmt.Errorf("upload stream ended after %d of %d bytes", written, spec.Expected)
 	}
 	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return nil, err
-	}
-	if err := file.Close(); err != nil {
 		return nil, err
 	}
 
@@ -483,7 +499,6 @@ func writeUploadStreamChunk(spec uploadStreamSpec, source io.Reader) (json.RawMe
 		state.Parts = make(map[int64]struct{})
 	}
 	state.Parts[spec.ChunkIndex] = struct{}{}
-	state.TempPath = partPath
 	state.CreatedAt = time.Now()
 	uploadChunks[spec.UploadID] = state
 	uploadChunksMu.Unlock()
@@ -492,6 +507,15 @@ func writeUploadStreamChunk(spec uploadStreamSpec, source io.Reader) (json.RawMe
 		"received": written,
 		"offset":   spec.Offset + written,
 	})
+}
+
+// Call with uploadChunksMu held. Never reclaim a handle that is writing data.
+func pruneUploadSessionsLocked(now time.Time) {
+	for id, state := range uploadChunks {
+		if state.ActiveWrites == 0 && now.Sub(state.CreatedAt) > uploadSessionIdleTimeout {
+			_ = removeUploadFileLocked(id)
+		}
+	}
 }
 
 type offsetFileWriter struct {

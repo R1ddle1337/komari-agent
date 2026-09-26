@@ -20,6 +20,7 @@ import (
 
 	"github.com/blang/semver"
 	binaryupdate "github.com/inconshreveable/go-update"
+	"github.com/komari-monitor/komari-agent/utils"
 )
 
 const maxBinaryBytes = 64 << 20
@@ -97,7 +98,7 @@ func (u *Updater) get(path, accept string, limit int64) ([]byte, error) {
 	}
 	response, err := u.config.HTTPClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, utils.SanitizeHTTPError(err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {

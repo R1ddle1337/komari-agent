@@ -14,7 +14,7 @@ func ConvertIDNToASCII(urlStr string) (string, error) {
 	// 解析 URL
 	parsedURL, err := url.Parse(urlStr)
 	if err != nil {
-		return urlStr, err
+		return urlStr, SanitizeHTTPError(err)
 	}
 
 	hostname := parsedURL.Hostname()

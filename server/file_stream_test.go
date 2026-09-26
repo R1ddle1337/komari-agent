@@ -29,6 +29,9 @@ func preserveAgentConfig(t *testing.T, endpoint string) {
 func resetUploadStreamState(t *testing.T) {
 	t.Helper()
 	uploadChunksMu.Lock()
+	for id := range uploadChunks {
+		_ = removeUploadFileLocked(id)
+	}
 	uploadChunks = make(map[string]uploadChunkState)
 	uploadChunksMu.Unlock()
 	uploadWriteLocksMu.Lock()
@@ -39,6 +42,9 @@ func resetUploadStreamState(t *testing.T) {
 	uploadLifecycleMu.Unlock()
 	t.Cleanup(func() {
 		uploadChunksMu.Lock()
+		for id := range uploadChunks {
+			_ = removeUploadFileLocked(id)
+		}
 		uploadChunks = make(map[string]uploadChunkState)
 		uploadChunksMu.Unlock()
 		uploadLifecycleMu.Lock()
@@ -147,7 +153,7 @@ func TestReceiveUploadStreamWritesWithoutBufferingWholeBody(t *testing.T) {
 	if len(raw) == 0 {
 		t.Fatal("receiveUploadStream returned an empty result")
 	}
-	partPath := uploadPartPathFor(resolveFilePath(target), "upload-id")
+	partPath := uploadPartPath(t, "upload-id")
 	got, err := os.ReadFile(partPath)
 	if err != nil {
 		t.Fatalf("read part file: %v", err)
@@ -197,7 +203,7 @@ func TestUploadStreamChunksWriteAtDistinctOffsets(t *testing.T) {
 	if secondErr != nil || thirdErr != nil {
 		t.Fatalf("parallel writes failed: second=%v third=%v", secondErr, thirdErr)
 	}
-	partPath := uploadPartPathFor(resolveFilePath(target), "parallel-upload")
+	partPath := uploadPartPath(t, "parallel-upload")
 	got, err := os.ReadFile(partPath)
 	if err != nil {
 		t.Fatalf("read parallel part: %v", err)
@@ -233,7 +239,7 @@ func TestFirstUploadStreamRetryPreservesOtherParts(t *testing.T) {
 	if _, err := writeUploadStreamChunk(spec, bytes.NewReader([]byte("1111"))); err != nil {
 		t.Fatal(err)
 	}
-	partPath := uploadPartPathFor(spec.Path, spec.UploadID)
+	partPath := uploadPartPath(t, spec.UploadID)
 	got, err := os.ReadFile(partPath)
 	if err != nil {
 		t.Fatal(err)
@@ -268,6 +274,7 @@ func TestCommitFileUploadFinalizesRawStream(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	partPath := uploadPartPath(t, spec.UploadID)
 	result, err := commitFileUpload(map[string]interface{}{
 		"path":        target,
 		"upload_id":   spec.UploadID,
@@ -288,7 +295,7 @@ func TestCommitFileUploadFinalizesRawStream(t *testing.T) {
 	if !bytes.Equal(got, []byte("aaaabbbb")) {
 		t.Fatalf("committed content = %q", got)
 	}
-	if _, err := os.Stat(uploadPartPathFor(spec.Path, spec.UploadID)); !os.IsNotExist(err) {
+	if _, err := os.Stat(partPath); !os.IsNotExist(err) {
 		t.Fatalf("part file still exists after commit: %v", err)
 	}
 }
@@ -318,4 +325,17 @@ func TestCancelUploadStreamsInterruptsActiveStream(t *testing.T) {
 	}
 	end()
 	waitUploadStreams("cancel-active")
+}
+
+func uploadPartPath(t *testing.T, uploadID string) string {
+	t.Helper()
+	uploadChunksMu.Lock()
+	state, ok := uploadChunks[uploadID]
+	uploadChunksMu.Unlock()
+	if !ok {
+		t.Fatal("upload session is missing")
+	}
+	// Close before the test's temporary directory cleanup, including on Windows.
+	t.Cleanup(func() { uploadChunksMu.Lock(); _ = removeUploadFileLocked(uploadID); uploadChunksMu.Unlock() })
+	return state.TempPath
 }

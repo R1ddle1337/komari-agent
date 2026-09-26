@@ -51,17 +51,34 @@ func getAutoDiscoveryFilePath() string {
 
 // loadAutoDiscoveryConfig 加载自动发现配置
 func loadAutoDiscoveryConfig() (*AutoDiscoveryConfig, error) {
-	configPath := getAutoDiscoveryFilePath()
+	return readAutoDiscoveryConfig(getAutoDiscoveryFilePath())
+}
 
-	// 检查文件是否存在
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+func readAutoDiscoveryConfig(configPath string) (*AutoDiscoveryConfig, error) {
+	file, err := os.Open(configPath)
+	if os.IsNotExist(err) {
 		return nil, nil // 文件不存在，返回nil
 	}
-
-	// 读取文件内容
-	data, err := os.ReadFile(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read auto-discovery config: %v", err)
+	}
+	defer file.Close()
+	// Tighten files created by earlier versions before loading credentials.
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to inspect auto-discovery config: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("auto-discovery config must be a regular file")
+	}
+	if info.Mode().Perm() != 0o600 {
+		if err := file.Chmod(0o600); err != nil {
+			return nil, fmt.Errorf("failed to secure auto-discovery config: %w", err)
+		}
+	}
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read auto-discovery config: %w", err)
 	}
 
 	// 解析JSON
@@ -76,19 +93,41 @@ func loadAutoDiscoveryConfig() (*AutoDiscoveryConfig, error) {
 // saveAutoDiscoveryConfig 保存自动发现配置
 func saveAutoDiscoveryConfig(config *AutoDiscoveryConfig) error {
 	configPath := getAutoDiscoveryFilePath()
+	if err := writeAutoDiscoveryConfig(configPath, config); err != nil {
+		return err
+	}
+	log.Printf("Auto-discovery config saved to: %s", configPath)
+	return nil
+}
 
+func writeAutoDiscoveryConfig(configPath string, config *AutoDiscoveryConfig) error {
 	// 序列化为JSON
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal auto-discovery config: %v", err)
 	}
 
-	// 写入文件
-	if err := os.WriteFile(configPath, data, 0644); err != nil {
+	file, err := os.CreateTemp(filepath.Dir(configPath), ".auto-discovery-*")
+	if err != nil {
 		return fmt.Errorf("failed to write auto-discovery config: %v", err)
 	}
-
-	log.Printf("Auto-discovery config saved to: %s", configPath)
+	defer os.Remove(file.Name())
+	defer file.Close()
+	if err := file.Chmod(0o600); err != nil {
+		return fmt.Errorf("failed to secure auto-discovery config: %w", err)
+	}
+	if _, err := file.Write(data); err != nil {
+		return fmt.Errorf("failed to write auto-discovery config: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync auto-discovery config: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("failed to close auto-discovery config: %w", err)
+	}
+	if err := os.Rename(file.Name(), configPath); err != nil {
+		return fmt.Errorf("failed to replace auto-discovery config: %w", err)
+	}
 	return nil
 }
 
@@ -124,7 +163,7 @@ func registerWithAutoDiscovery() error {
 	// 创建HTTP请求
 	req, err := http.NewRequest("POST", registerURL, bytes.NewBuffer(jsonData))
 	if err != nil {
-		return fmt.Errorf("failed to create register request: %v", err)
+		return fmt.Errorf("failed to create register request: %v", utils.SanitizeHTTPError(err))
 	}
 
 	// 设置请求头
@@ -135,7 +174,7 @@ func registerWithAutoDiscovery() error {
 	client := dnsresolver.GetHTTPClientWithPreference(30*time.Second, flags.PreferIPVersion)
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to send register request: %v", err)
+		return fmt.Errorf("failed to send register request: %v", utils.SanitizeHTTPError(err))
 	}
 	defer resp.Body.Close()
 

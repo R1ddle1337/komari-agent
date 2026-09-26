@@ -14,8 +14,19 @@ import (
 	"time"
 
 	"github.com/blang/semver"
+	pkgflags "github.com/komari-monitor/komari-agent/cmd/flags"
 	"github.com/komari-monitor/komari-agent/internal/selfupdate"
 )
+
+func TestUpdaterConfigAlwaysValidatesTLS(t *testing.T) {
+	previous := pkgflags.GlobalConfig.IgnoreUnsafeCert
+	t.Cleanup(func() { pkgflags.GlobalConfig.IgnoreUnsafeCert = previous })
+	pkgflags.GlobalConfig.IgnoreUnsafeCert = true
+	transport, ok := updaterConfig().HTTPClient.Transport.(*http.Transport)
+	if !ok || transport.TLSClientConfig == nil || transport.TLSClientConfig.InsecureSkipVerify {
+		t.Fatal("updater must always use a TLS-verifying transport")
+	}
+}
 
 func TestRepoSlugValidation(t *testing.T) {
 	for _, slug := range []string{"", "owner", "owner/repo/extra", "../repo", "owner/..", "owner/repo?x=1", "owner/repo#x", "owner/repo%2fother", "owner\\repo/name", "owner /repo"} {

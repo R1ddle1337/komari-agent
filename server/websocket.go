@@ -226,7 +226,7 @@ func postV2RequestContext(ctx context.Context, payload []byte) (*v2.Response, er
 	}
 	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, utils.SanitizeHTTPError(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if compressed {
@@ -235,7 +235,7 @@ func postV2RequestContext(ctx context.Context, payload []byte) (*v2.Response, er
 	client := dnsresolver.GetHTTPClientWithPreference(35*time.Second, flags.PreferIPVersion)
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, utils.SanitizeHTTPError(err)
 	}
 	defer resp.Body.Close()
 	bytesBody, err := readControlResponse(resp.Body)
@@ -344,7 +344,7 @@ func connectWebSocket(websocketEndpoint string) (*ws.SafeConn, error) {
 		if resp != nil && resp.StatusCode != 101 {
 			return nil, &httpStatusError{StatusCode: resp.StatusCode, Status: resp.Status}
 		}
-		return nil, err
+		return nil, utils.SanitizeHTTPError(err)
 	}
 
 	return ws.NewSafeConn(conn), nil
@@ -446,7 +446,7 @@ func establishTerminalConnection(token, id, endpoint string) {
 
 	conn, _, err := dialer.Dial(endpoint, nil)
 	if err != nil {
-		log.Println("Failed to establish terminal connection:", err)
+		log.Println("Failed to establish terminal connection:", utils.SanitizeHTTPError(err))
 		return
 	}
 

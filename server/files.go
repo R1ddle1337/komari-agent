@@ -23,6 +23,7 @@ import (
 	pkg_flags "github.com/komari-monitor/komari-agent/cmd/flags"
 	"github.com/komari-monitor/komari-agent/dnsresolver"
 	v2 "github.com/komari-monitor/komari-agent/protocol/v2"
+	"github.com/komari-monitor/komari-agent/utils"
 )
 
 const (
@@ -55,6 +56,9 @@ type uploadChunkState struct {
 	Parts        map[int64]struct{}
 	PartCount    int64
 	TempPath     string
+	File         *os.File
+	FileInfo     os.FileInfo
+	ActiveWrites int
 	CreatedAt    time.Time
 }
 
@@ -529,13 +533,18 @@ func uploadChunkCount(size, chunkSize int64) int64 {
 	return (size + chunkSize - 1) / chunkSize
 }
 
-func uploadPartPathFor(targetPath, uploadID string) string {
-	target := filepath.ToSlash(targetPath)
-	name := filepath.Base(target)
-	if name == "" || name == "." || name == "/" {
-		name = "upload"
+func verifyUploadPart(state uploadChunkState) error {
+	if state.File == nil || state.FileInfo == nil || state.TempPath == "" {
+		return errors.New("upload part file is missing")
 	}
-	return filepath.Join(filepath.Dir(target), "."+name+".komari-upload-"+uploadID+".part")
+	info, err := os.Lstat(state.TempPath)
+	if err != nil {
+		return fmt.Errorf("upload part file is unavailable: %w", err)
+	}
+	if !info.Mode().IsRegular() || !os.SameFile(state.FileInfo, info) {
+		return errors.New("upload part file was replaced")
+	}
+	return nil
 }
 
 func syncUploadDirectory(dir string) error {
@@ -555,12 +564,17 @@ func removeUploadFileLocked(uploadID string) error {
 	if !ok {
 		return nil
 	}
-	if state.TempPath != "" {
+	delete(uploadChunks, uploadID)
+	if state.File != nil {
+		_ = state.File.Close()
+	}
+	// Only remove the registered file. A replaced path belongs to somebody
+	// else, and a missing session cannot establish ownership after a restart.
+	if verifyUploadPart(state) == nil {
 		if err := os.Remove(state.TempPath); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
-	delete(uploadChunks, uploadID)
 	return nil
 }
 
@@ -601,14 +615,6 @@ func cancelFileUpload(args map[string]interface{}) (json.RawMessage, error) {
 	}
 	uploadChunksMu.Unlock()
 
-	// A process restart can discard the in-memory state while leaving the part
-	// file behind. Derive the deterministic path and remove only that file.
-	if targetPath != "" {
-		partPath := uploadPartPathFor(targetPath, uploadID)
-		if err := os.Remove(partPath); err != nil && !os.IsNotExist(err) {
-			return nil, err
-		}
-	}
 	return json.Marshal(map[string]any{"cancelled": true})
 }
 
@@ -680,11 +686,11 @@ func commitFileUpload(args map[string]interface{}) (json.RawMessage, error) {
 	}
 	partPath := state.TempPath
 	uploadChunksMu.Unlock()
-	if partPath == "" {
-		return nil, errors.New("upload part file is missing")
+	if err := verifyUploadPart(state); err != nil {
+		return nil, err
 	}
 
-	partInfo, err := os.Stat(partPath)
+	partInfo, err := state.File.Stat()
 	if err != nil {
 		return nil, err
 	}
@@ -692,7 +698,7 @@ func commitFileUpload(args map[string]interface{}) (json.RawMessage, error) {
 		return nil, fmt.Errorf("upload part file is %d bytes, want %d", partInfo.Size(), totalSize)
 	}
 	if partInfo.Size() > totalSize {
-		if err := os.Truncate(partPath, totalSize); err != nil {
+		if err := state.File.Truncate(totalSize); err != nil {
 			return nil, err
 		}
 	}
@@ -704,23 +710,36 @@ func commitFileUpload(args map[string]interface{}) (json.RawMessage, error) {
 		if info.IsDir() {
 			return nil, errors.New("cannot replace a directory with a file")
 		}
-		if err := os.Chmod(partPath, info.Mode().Perm()); err != nil {
+		if err := state.File.Chmod(info.Mode().Perm()); err != nil {
 			return nil, err
 		}
 	} else if !os.IsNotExist(statErr) {
 		return nil, statErr
-	} else if err := os.Chmod(partPath, 0o644); err != nil {
+	} else if err := state.File.Chmod(0o644); err != nil {
 		return nil, err
 	}
-	if err := replaceFile(partPath, path); err != nil {
+	if err := state.File.Sync(); err != nil {
+		return nil, err
+	}
+	// Windows requires the open upload handle to be closed before renaming.
+	// Every failure after closing ends the session rather than reopening a path.
+	defer func() {
+		uploadChunksMu.Lock()
+		_ = removeUploadFileLocked(uploadID)
+		uploadChunksMu.Unlock()
+	}()
+	if err := state.File.Close(); err != nil {
+		return nil, err
+	}
+	if err := verifyUploadPart(state); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(partPath, path); err != nil {
 		return nil, err
 	}
 	if err := syncUploadDirectory(targetDir); err != nil {
 		return nil, err
 	}
-	uploadChunksMu.Lock()
-	delete(uploadChunks, uploadID)
-	uploadChunksMu.Unlock()
 	return json.Marshal(map[string]any{
 		"received": totalSize,
 		"final":    true,
@@ -814,7 +833,7 @@ func postFileResult(result v2.FileResult) {
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
-			log.Printf("failed to create file result request: %v", err)
+			log.Printf("failed to create file result request: %v", utils.SanitizeHTTPError(err))
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
@@ -837,7 +856,7 @@ func postFileResult(result v2.FileResult) {
 			continue
 		}
 		if err != nil {
-			log.Printf("failed to return file result: %v", err)
+			log.Printf("failed to return file result: %v", utils.SanitizeHTTPError(err))
 		} else if response != nil {
 			log.Printf("file result endpoint returned %s", response.Status)
 		}
